@@ -101,6 +101,14 @@ if args.contains("--p10") {
     let tokJson = pos.dropFirst().first ?? "Goldens/token_ids.json"
     runP10(tokenizerFolder: tokFolder, tokenGoldensPath: tokJson)  // exits
 }
+if args.contains("--ab-dtype") {
+    let pos = args.dropFirst().filter { !$0.hasPrefix("--") }
+    guard pos.count >= 2 else {
+        fail("--ab-dtype needs <model.safetensors> <codec.safetensors> [p8_goldens.safetensors]")
+    }
+    let gp = pos.count >= 3 ? pos[2] : "Goldens/p8_goldens.safetensors"
+    runABDtype(modelPath: pos[0], codecPath: pos[1], goldensPath: gp)  // exits
+}
 if args.contains("--validate") {
     let pos = args.dropFirst().filter { !$0.hasPrefix("--") }
     let modelDir = pos.first ?? (NSHomeDirectory() + "/Development/_gepard-oracle/gepard_ckpt")
@@ -922,6 +930,189 @@ func runValidate(modelDir: String, codecDir: String, refWavPath: String) -> Neve
     if let failure { fail(failure) }
     print("\nGEPARD_VALIDATE complete.")
     exit(0)
+}
+
+// MARK: - --ab-dtype: bf16 (runtime) vs fp32 (P-gate) rollout A/B on ONE GPU stream
+
+// The P-gates validated the LM upcast to fp32 (CPU stream). The runtime (GepardModel) binds the
+// LM at native bf16 for the ~1.1 GB resident target. This gate loads the SAME weights twice —
+// once cast to fp32, once cast to bf16 — computes the speaker prefix + greedy rollout for each on
+// the GPU stream (so DTYPE is the only variable, not device), and reports: (1) whether the bf16
+// rollout is audible-valid after codec decode, (2) how far the two argmax code sequences agree,
+// and (3) where/how they first diverge. Backbone GEMM K ≤ 3584 (< the NAX split-K bf16 hazard),
+// so bf16 on this GPU is trustworthy. The codec stays fp32 in both arms (not the variable).
+
+func bindBackboneDtype(_ raw: [String: MLXArray], _ dt: DType) -> GepardBackbone {
+    var w: [String: MLXArray] = [:]
+    for (k, v) in raw where k.hasPrefix("model.") { w[String(k.dropFirst(6))] = v.asType(dt) }
+    let m = GepardBackbone(GepardBackboneConfig())
+    do { try m.update(parameters: ModuleParameters.unflattened(w), verify: [.all]) }
+    catch { fail("backbone bind (\(dt)): \(error)") }
+    return m
+}
+func bindAudioDtype(_ raw: [String: MLXArray], levels: [Int], _ dt: DType) -> AudioInterface {
+    var w: [String: MLXArray] = [:]
+    for (k, v) in raw where k.hasPrefix("audio_embeddings.") || k.hasPrefix("audio_embed_proj.") || k == "audio_embed_scale" {
+        w[AudioInterface.remapProjKey(k)] = v.asType(dt)
+    }
+    let m = AudioInterface(levels: levels)
+    do { try m.update(parameters: ModuleParameters.unflattened(w), verify: [.all]) }
+    catch { fail("audio bind (\(dt)): \(error)") }
+    return m
+}
+func bindHeadsDtype(_ raw: [String: MLXArray], levels: [Int], _ dt: DType) -> CodebookHeads {
+    var w: [String: MLXArray] = [:]
+    for (k, v) in raw where k.hasPrefix("codebook_heads.") || k.hasPrefix("stop_head.") { w[k] = v.asType(dt) }
+    let m = CodebookHeads(levels: levels)
+    do { try m.update(parameters: ModuleParameters.unflattened(w), verify: [.all]) }
+    catch { fail("heads bind (\(dt)): \(error)") }
+    return m
+}
+func bindRefCompressorDtype(_ raw: [String: MLXArray], _ dt: DType) -> RefCompressor {
+    var w: [String: MLXArray] = [:]
+    for (k, v) in raw where k.hasPrefix("ref_compressor.") { w[String(k.dropFirst("ref_compressor.".count))] = v.asType(dt) }
+    let m = RefCompressor()
+    do { try m.update(parameters: ModuleParameters.unflattened(w), verify: [.all]) } catch { fail("ref_compressor bind (\(dt)): \(error)") }
+    return m
+}
+
+func runABDtype(modelPath: String, codecPath: String, goldensPath: String) -> Never {
+    Device.setDefault(device: Device(.gpu))       // runtime device; dtype is the only variable
+    print("AB-DTYPE  bf16 (runtime) vs fp32 (P-gate) rollout on the GPU stream")
+
+    let levels = (0 ..< 32).map { [8, 7, 6, 6][$0 % 4] }
+    let raw: [String: MLXArray]
+    do { raw = try loadArrays(url: URL(fileURLWithPath: modelPath)) } catch { fail("load model: \(error)") }
+    let craw: [String: MLXArray]
+    do { craw = try loadArrays(url: URL(fileURLWithPath: codecPath)) } catch { fail("load codec: \(error)") }
+    let codec = NanoCodecDecoder(weights: craw)   // fp32 in both arms — not the variable
+
+    let g: [String: MLXArray]
+    do { g = try loadArrays(url: URL(fileURLWithPath: goldensPath)) } catch { fail("load goldens: \(error)") }
+    guard let refCodes = g["ref_codes"]?.asType(.int32), let condIds = g["canonical_cond_ids"]
+    else { fail("ab goldens missing ref_codes / canonical_cond_ids") }
+
+    let maxFrames = 200
+    func rolloutFor(_ dt: DType) -> GepardDecoder.Rollout {
+        let dec = GepardDecoder(backbone: bindBackboneDtype(raw, dt),
+                                audio: bindAudioDtype(raw, levels: levels, dt),
+                                heads: bindHeadsDtype(raw, levels: levels, dt))
+        let rc = bindRefCompressorDtype(raw, dt)
+        eval(dec.backbone, dec.audio, dec.heads, rc)
+        let prefix = rc(refCodes: refCodes).prefix; eval(prefix)
+        let r = dec.greedyRollout(prefix: prefix, condIds: condIds, maxFrames: maxFrames)
+        return r
+    }
+
+    let fp32 = rolloutFor(.float32)
+    let bf16 = rolloutFor(.bfloat16)
+    print("  fp32: \(fp32.codes.count) frames · bf16: \(bf16.codes.count) frames")
+
+    // (1) bf16 audible-valid after codec decode
+    func decodeToSamples(_ frames: [[Int]]) -> [Float] {
+        let T = frames.count
+        var flat = [Int32](repeating: 0, count: 32 * T)
+        for t in 0 ..< T { for c in 0 ..< 32 { flat[c * T + t] = Int32(frames[t][c]) } }
+        let w = codec.decode(NanoCodecDecoder.dequantize(MLXArray(flat, [1, 32, T]))).reshaped([-1]); eval(w)
+        return w.asArray(Float.self)
+    }
+    let sBf = decodeToSamples(bf16.codes)
+    let rmsBf = sqrt(sBf.reduce(0) { $0 + $1 * $1 } / Float(max(sBf.count, 1)))
+    let peakBf = sBf.map { abs($0) }.max() ?? 0
+    let finiteBf = sBf.allSatisfy { $0.isFinite }
+    let audibleBf = finiteBf && rmsBf > 1e-3 && peakBf > 0.02 && sBf.count == bf16.codes.count * 1024
+    print(String(format: "  (1) bf16 audio: %d samples · rms %.4f · peak %.3f · finite %@ → %@",
+                 sBf.count, rmsBf, peakBf, finiteBf ? "yes" : "NO", audibleBf ? "AUDIBLE-VALID" : "INVALID"))
+
+    // (2)/(3) argmax agreement between the two dtype rollouts
+    let common = min(fp32.codes.count, bf16.codes.count)
+    var matchLen = 0
+    while matchLen < common {
+        if (0 ..< 32).contains(where: { fp32.codes[matchLen][$0] != bf16.codes[matchLen][$0] }) { break }
+        matchLen += 1
+    }
+    var flips = 0, firstDivFrame = -1, firstDivCb = -1
+    for t in 0 ..< common {
+        for c in 0 ..< 32 where fp32.codes[t][c] != bf16.codes[t][c] {
+            flips += 1
+            if firstDivFrame < 0 { firstDivFrame = t; firstDivCb = c }
+        }
+    }
+    let totalCodes = common * 32
+    let pctAgree = 100.0 * Double(totalCodes - flips) / Double(max(totalCodes, 1))
+    print(String(format: "  (2) argmax agreement over %d common frames: prefix-exact %d/%d frames · %d/%d codebook flips (%.3f%% agree)",
+                 common, matchLen, common, flips, totalCodes, pctAgree))
+    if firstDivFrame >= 0 {
+        print("  (3) first divergence: frame \(firstDivFrame), codebook \(firstDivCb) "
+              + "(fp32=\(fp32.codes[firstDivFrame][firstDivCb]) bf16=\(bf16.codes[firstDivFrame][firstDivCb]))")
+    } else {
+        print("  (3) first divergence: NONE over the common length — bit-identical argmax")
+    }
+
+    // Audio-level divergence (bf16 vs fp32 decoded), scale-invariant, on the common frames.
+    let sFp = decodeToSamples(fp32.codes)
+    let n = min(sFp.count, sBf.count)
+    if n > 0 {
+        let a = MLXArray(Array(sBf[0..<n])), b = MLXArray(Array(sFp[0..<n]))
+        let ac = a - a.mean(), bc = b - b.mean()
+        let corr = (ac * bc).sum().item(Float.self) / (sqrt((ac * ac).sum() * (bc * bc).sum()).item(Float.self) + 1e-12)
+        print(String(format: "  (aux) bf16-vs-fp32 decoded-audio corr over %d common samples: %.5f%@",
+                     n, corr, fp32.codes.count == bf16.codes.count ? "" : "  (length differs — corr on prefix only)"))
+    }
+
+    // (4) Teacher-forced isolation: feed the fp32 rollout's history to a bf16 model and, at each
+    // frame, compare bf16's argmax to fp32's chosen code — recording the bf16 logit gap between
+    // its own pick and fp32's pick. Gap < TIE ⇒ a near-tie bf16 merely tipped (benign; the
+    // free-run divergence is an autoregressive cascade from such tips, not broken numerics).
+    // Gap ≥ TIE ⇒ a decisive bf16 argmax error at identical input. (P6's TIE = 5e-3, but that
+    // gated fp32-vs-fp32; bf16 eps ≈ 7.8e-3, so we also report the gap distribution, not a verdict.)
+    let TIE: Float = 5e-3
+    let decBf = GepardDecoder(backbone: bindBackboneDtype(raw, .bfloat16),
+                              audio: bindAudioDtype(raw, levels: levels, .bfloat16),
+                              heads: bindHeadsDtype(raw, levels: levels, .bfloat16))
+    let rcBf = bindRefCompressorDtype(raw, .bfloat16)
+    eval(decBf.backbone, decBf.audio, decBf.heads, rcBf)
+    let prefixBf = rcBf(refCodes: refCodes).prefix; eval(prefixBf)
+    let Tforce = fp32.codes.count
+    func fpFrame(_ t: Int) -> [Int] { fp32.codes[t] }
+    var tfMismatch = 0, tfDecisive = 0
+    var worstTie: Float = 0, worstDecisive: Float = 0
+    func score(_ t: Int, _ logits: [MLXArray]) {
+        let gf = fpFrame(t)
+        for c in 0 ..< 32 {
+            let v = logits[c].asType(.float32).reshaped(-1).asArray(Float.self)
+            let mine = v.firstIndex(of: v.max()!)!
+            if mine != gf[c] {
+                tfMismatch += 1
+                let gap = v[mine] - v[gf[c]]           // bf16's pick minus fp32's pick (≥ 0)
+                if gap >= TIE { tfDecisive += 1; worstDecisive = max(worstDecisive, gap) }
+                else { worstTie = max(worstTie, gap) }
+            }
+        }
+    }
+    var (hb, cb) = decBf.prefill(prefix: prefixBf, condIds: condIds)
+    score(0, decBf.heads(hb).logits)
+    for t in 1 ..< Tforce {
+        hb = decBf.decodeStep(frameEmbed: decBf.audio.frameEmbed(codes: fpFrame(t - 1)), cache: cb)
+        score(t, decBf.heads(hb).logits)
+    }
+    let tfTotal = Tforce * 32
+    print(String(format: "  (4) teacher-forced (bf16 on fp32 history, %d frames): %d/%d flips · %d decisive (gap≥%.0e, worst %.2e) · near-tie worst gap %.2e",
+                 Tforce, tfMismatch, tfTotal, tfDecisive, TIE, worstDecisive, worstTie))
+    if tfDecisive == 0 {
+        print("      → bf16 introduces NO decisive argmax errors at identical input; free-run divergence is a benign AR cascade off near-tie tips.")
+    } else {
+        print("      → bf16 flips \(tfDecisive) codebook argmax(es) DECISIVELY vs fp32 at identical input (real precision loss, not just ties).")
+    }
+
+    print("")
+    if audibleBf {
+        print("AB-DTYPE PASS — bf16 runtime path yields valid speech; divergence report above.")
+        exit(0)
+    } else {
+        print("AB-DTYPE FAIL — bf16 output not audible-valid")
+        exit(1)
+    }
 }
 
 /// Minimal 16-bit PCM WAV → [Float] decoder (the wrapper emits canonical 16-bit WAV).
