@@ -15,8 +15,9 @@
 // cover the inference port; P10 gates the tokenizer→cond_ids path added at engine-wrap.
 // XCTest carries the offline Stage-2 checks (manifest + MAT-1..5 + CAN-1..3).
 //
-// Engine contract pinned ≥0.28.0 (ships SPDXLicense.nvidiaOpenModel on the permissive
-// allowlist — both Gepard weight layers admit under the default `.permissiveOnly`).
+// Engine contract pinned ≥0.28.1 (0.28.0 ships SPDXLicense.nvidiaOpenModel on the permissive
+// allowlist — both Gepard weight layers admit under the default `.permissiveOnly`; 0.28.1
+// registered Specialty.voiceClone/.realtimeStreaming, this package's selection axes).
 // Deliberately NO mlx-audio-dsp: Gepard has no mel/STFT (codec codes are the only audio
 // features); the wrapper's only DSP need is a windowed-sinc resampler, which is inline
 // pure-Swift in AudioSupport.
@@ -40,8 +41,9 @@ let package = Package(
         // Faithful Qwen byte-level BPE (tokenizer.json) for text → cond_ids.
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
         // Engine contract — 0.28.0 brought SPDXLicense.nvidiaOpenModel (permissive allowlist);
+        // 0.28.1 registered Specialty.voiceClone/.realtimeStreaming (this package's selection axes).
         // MLXServeConformance is the MAT/CAN offline gate harness.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.28.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.28.1"),
         // Native downloader for WeightSourcing auto-materialization.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
     ],

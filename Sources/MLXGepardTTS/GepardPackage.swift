@@ -64,8 +64,8 @@ public final class GepardPackage: ModelPackage {
             specialties: [
                 // Gepard has no emotion/duration control (no E12 lane). Its selection signal is
                 // zero-shot voice cloning + a realtime/streaming architecture — the companion voice.
-                SpecialtyWeight("voiceClone", strength: 1.0),
-                SpecialtyWeight("realtimeStreaming", strength: 1.0),
+                SpecialtyWeight(.voiceClone, strength: 1.0),
+                SpecialtyWeight(.realtimeStreaming, strength: 1.0),
                 SpecialtyWeight(.companion, strength: 0.8),
             ],
             surfaces: [
