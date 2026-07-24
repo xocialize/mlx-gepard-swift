@@ -22,6 +22,9 @@ import MLXToolKit
 ///   auto-on-for-short-text policy lives app-side; the capability just exposes the knob.
 /// - `cfgFrames` (int, default 20): onset window CFG is applied over.
 /// - `maxFrames` (int, default 2000 ≈ 93 s): hard generation cap.
+/// - `stopThreshold` (double, default 0.5): sigmoid threshold on the stop head (oracle
+///   `stop_threshold`). The head is prefix-conditioned — clips whose prefix pushes it past
+///   0.5 at a sentence pause truncate multi-sentence text; 0.7–0.9 rescues those.
 /// - `seed` (int): reproducible sampling, clamped to 32 bits. NOTE: V1 decoding is deterministic
 ///   argmax, so the seed is currently a no-op — accepted for forward-compat when a temperature
 ///   sampling path lands.
@@ -98,16 +101,16 @@ public final class GepardPackage: ModelPackage {
     public func load() async throws {
         guard model == nil else { return }
 
-        // Auto-materialize missing sources into the engine store (dir-less configs only;
-        // explicit directories never touch the network).
+        // Materialization is ENGINE-EXECUTED since contract 1.24 (engine ≥ 0.32.0): the engine
+        // downloads the declared missing sources into the store BEFORE load(). This guard is the
+        // offline backstop only — reaching it means no engine materialization ran (no store set,
+        // or a non-engine caller) and the sources genuinely aren't on disk.
         let storeRoot = configuration.modelsRootDirectory
         let missing = configuration.missingWeightSources(storeRoot: storeRoot)
-        if !missing.isEmpty {
-            guard let storeRoot else {
-                throw GepardError.missingWeights(
-                    "no models root set and sources missing: \(missing.map(\.role).joined(separator: ", "))")
-            }
-            try await WeightMaterializer.materialize(missing, into: storeRoot)
+        guard missing.isEmpty else {
+            throw GepardError.missingWeights(
+                "sources not materialized: \(missing.map(\.role).joined(separator: ", ")) "
+                + (storeRoot.map { "(store: \($0.path))" } ?? "(no models root set)"))
         }
         try Task.checkCancellation()
 
@@ -177,6 +180,12 @@ public final class GepardPackage: ModelPackage {
         }
         let maxFrames = tts.metaData.intValue("maxFrames") ?? 2000
         var options = GepardDecoder.Options(maxFrames: max(1, maxFrames))
+        if let stopThreshold = tts.metaData.doubleValue("stopThreshold") {
+            // The stop head is prefix-conditioned: some reference clips cross 0.5 at a
+            // mid-utterance sentence pause and truncate multi-sentence text. Clamp to a sane
+            // sigmoid band; the oracle exposes the same knob (runner.py stop_threshold).
+            options.stopThreshold = Float(min(max(stopThreshold, 0.05), 0.99))
+        }
         if let cfgScale = tts.metaData.doubleValue("cfgScale") {
             options.cfgScale = Float(cfgScale)
             options.cfgFrames = tts.metaData.intValue("cfgFrames") ?? 20

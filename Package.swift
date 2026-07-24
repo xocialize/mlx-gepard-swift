@@ -43,9 +43,8 @@ let package = Package(
         // Engine contract — 0.28.0 brought SPDXLicense.nvidiaOpenModel (permissive allowlist);
         // 0.28.1 registered Specialty.voiceClone/.realtimeStreaming (this package's selection axes).
         // MLXServeConformance is the MAT/CAN offline gate harness.
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.28.1"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.32.0"),
         // Native downloader for WeightSourcing auto-materialization.
-        .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
     ],
     targets: [
         .target(
@@ -80,7 +79,6 @@ let package = Package(
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
-                .product(name: "HuggingFace", package: "swift-huggingface"),
             ],
             path: "Sources/MLXGepardTTS",
             swiftSettings: [.swiftLanguageMode(.v5)]

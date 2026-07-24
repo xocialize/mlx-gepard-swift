@@ -88,6 +88,7 @@ internally) and its prepared speaker prefix is memoized per clip for long-form/m
 | `cfgScale` | double | *(off)* | Onset text-CFG weight `w` (tech-report §5.3 short-utterance rescue). Absent ⇒ the plain greedy path. |
 | `cfgFrames` | int | 20 | Onset window CFG is applied over. |
 | `maxFrames` | int | 2000 (~93 s) | Hard generation cap. |
+| `stopThreshold` | double | 0.5 | Sigmoid threshold on the stop head (oracle `stop_threshold`). Prefix-conditioned — some reference clips cross 0.5 at a sentence pause and truncate multi-sentence text; 0.7–0.9 rescues those. |
 | `seed` | int | — | Reserved (V1 decoding is deterministic greedy — currently a no-op). |
 
 > **On CFG:** onset-CFG rescues many short utterances but is **not universally safe** per-clip

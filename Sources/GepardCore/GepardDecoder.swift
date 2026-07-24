@@ -65,13 +65,20 @@ public struct GepardDecoder {
         public var cfgFrames: Int
         /// The uncond text ids (`[SOT, EOT, SOS]`); required when `cfgScale != nil`.
         public var uncondIds: [Int]?
+        /// Sigmoid threshold on the stop head (oracle runner.py `stop_threshold`, default 0.5).
+        /// The stop head is conditioned on the speaker prefix, so some reference clips push it
+        /// past 0.5 at a mid-utterance sentence pause — raising the threshold rescues those
+        /// premature stops (at the cost of occasional trailing babble at 0.9+).
+        public var stopThreshold: Float
 
         public init(maxFrames: Int = 2000, cfgScale: Float? = nil,
-                    cfgFrames: Int = 20, uncondIds: [Int]? = nil) {
+                    cfgFrames: Int = 20, uncondIds: [Int]? = nil,
+                    stopThreshold: Float = 0.5) {
             self.maxFrames = maxFrames
             self.cfgScale = cfgScale
             self.cfgFrames = cfgFrames
             self.uncondIds = uncondIds
+            self.stopThreshold = stopThreshold
         }
     }
 
@@ -134,7 +141,7 @@ public struct GepardDecoder {
             // Stop is read from the COND stream (runner.py) — forces eval, bounds the graph.
             let p = sigmoid(stop).item(Float.self)
             stops.append(p)
-            if p > 0.5 { break }
+            if p > options.stopThreshold { break }
 
             if cfgOn, step < options.cfgFrames, let uc = uCache {
                 let uh = decodeStep(frameEmbed: fe, cache: uc)   // same audio frame, empty text ctx
