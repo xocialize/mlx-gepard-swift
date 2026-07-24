@@ -101,10 +101,14 @@ public struct GepardDecoder {
     /// `cancelCheck` is invoked once per generated frame (the natural yield point, contract's
     /// CAN cadence); it rethrows its `CancellationError` UNCHANGED so the engine can classify
     /// user-cancel vs governor-preempt. `onFrame(count)` fires after each frame is committed
-    /// (1-based count), for `RunProgress` reporting from the wrapper.
+    /// (1-based count), for `RunProgress` reporting from the wrapper. `onFrameCodes` receives
+    /// each committed frame's 32 codebook indices in order (frame 0 included) — the streaming
+    /// emit seam (contract 1.25.0): a chunked codec decode hooks here without disturbing the
+    /// AR/KV state.
     public func rollout(
         prefix: MLXArray, condIds: MLXArray, options: Options,
-        cancelCheck: (() throws -> Void)?, onFrame: ((Int) -> Void)?
+        cancelCheck: (() throws -> Void)?, onFrame: ((Int) -> Void)?,
+        onFrameCodes: (([Int]) -> Void)? = nil
     ) rethrows -> Rollout {
         // Cond stream.
         var (hidden, cache) = prefill(prefix: prefix, condIds: condIds)
@@ -132,6 +136,7 @@ public struct GepardDecoder {
         var frames: [[Int]] = [frame0]
         var stops: [Float] = []
         onFrame?(1)
+        onFrameCodes?(frame0)
 
         for step in 1 ..< options.maxFrames {
             try cancelCheck?()
@@ -151,6 +156,7 @@ public struct GepardDecoder {
                 frames.append(argmaxFrame(logits: logits))
             }
             onFrame?(frames.count)
+            onFrameCodes?(frames[frames.count - 1])
         }
         _ = uHidden
         return Rollout(codes: frames, stopProbs: stops)

@@ -88,6 +88,43 @@ public final class NanoCodecDecoder {
                 }
             }
         }
+
+        self.leftReceptiveFieldFrames = Self.computeLeftReceptiveField(
+            preKernel: convW["pre"]!.dim(1),
+            postKernel: convW["post"]!.dim(1),
+            upKernels: (0 ..< NanoCodecDecoder.upSampleRates.count).map { convW["up.\($0)"]!.dim(1) },
+            upRates: NanoCodecDecoder.upSampleRates,
+            resKernelSizes: resKernelSizes, resDilations: resDilations)
+    }
+
+    // MARK: - Streaming (contract 1.25.0)
+
+    /// Left receptive field of the WHOLE decoder stack, in INPUT frames — computed from the
+    /// actual loaded kernel sizes at init. Every op is strictly causal (left-pad-only convs;
+    /// transpose convs trim right only), so a windowed re-decode of frames `[a-L, b)` that
+    /// discards the first `L·1024` output samples is **bit-identical** to a whole-utterance
+    /// decode of the emitted region whenever `L >= leftReceptiveFieldFrames`. This is what
+    /// makes Gepard's streaming decode exact rather than approximated. (~26 frames with the
+    /// NeMo-standard 2×stride up-kernels.)
+    public private(set) var leftReceptiveFieldFrames: Int = 0
+
+    /// Backward extent propagation, output → input. Per stage (walked in reverse): the res
+    /// layer's parallel kernel branches contribute max over branches of
+    /// `(ks-1)·Σ(dilation+1)` (each dilation block = in_conv `(ks-1)·d` + skip_conv `(ks-1)·1`),
+    /// then the transposed up-conv converts fine→coarse: `ceil((e + k - 1) / stride)`.
+    public static func computeLeftReceptiveField(
+        preKernel: Int, postKernel: Int, upKernels: [Int], upRates: [Int],
+        resKernelSizes: [Int], resDilations: [Int]
+    ) -> Int {
+        let resExtent = resKernelSizes.map { ks in
+            (ks - 1) * resDilations.reduce(0) { $0 + $1 + 1 }
+        }.max() ?? 0
+        var extent = postKernel - 1
+        for i in (0 ..< upRates.count).reversed() {
+            extent += resExtent
+            extent = Int((Double(extent + upKernels[i] - 1) / Double(upRates[i])).rounded(.up))
+        }
+        return extent + (preKernel - 1)
     }
 
     // MARK: - primitive ops (1:1 with the reference)

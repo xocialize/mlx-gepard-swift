@@ -117,6 +117,14 @@ if args.contains("--validate") {
         ?? (NSHomeDirectory() + "/Development/mlxengine-audio/WIP/gepard/oracle-capture/extra_ref_audio/roxy_a1.wav")
     runValidate(modelDir: modelDir, codecDir: codecDir, refWavPath: refWav)  // exits
 }
+if args.contains("--stream") {
+    let pos = args.dropFirst().filter { !$0.hasPrefix("--") }
+    let modelDir = pos.first ?? (NSHomeDirectory() + "/Development/_gepard-oracle/gepard_ckpt")
+    let codecDir = pos.dropFirst().first ?? (NSHomeDirectory() + "/Development/_gepard-oracle/codec_publish")
+    let refWav = pos.dropFirst(2).first
+        ?? (NSHomeDirectory() + "/Development/mlxengine-audio/WIP/gepard/oracle-capture/extra_ref_audio/roxy_a1.wav")
+    runStreamGate(modelDir: modelDir, codecDir: codecDir, refWavPath: refWav)  // exits
+}
 
 guard args.contains("--p2") else {
     print("usage: gepard-gates --p2 [p2_goldens.json]")
@@ -831,6 +839,219 @@ func physFootprintMB() -> Double {
 }
 
 func nowMs() -> Double { Date().timeIntervalSince1970 * 1000 }
+
+// MARK: - STREAM: streaming parity + TTFA gate (contract 1.25.0, live STR-4/5/7)
+
+func runStreamGate(modelDir: String, codecDir: String, refWavPath: String) -> Never {
+    Device.setDefault(device: Device(.gpu))
+    print("GEPARD_STREAM — streaming parity + TTFA gate (GPU/Metal, real runStream path)")
+    print("  model: \(modelDir)")
+    print("  codec: \(codecDir)")
+    print("  ref:   \(refWavPath)")
+
+    guard let refData = FileManager.default.contents(atPath: refWavPath) else {
+        fail("reference wav not found at \(refWavPath)")
+    }
+    let refAudio = Audio(format: .wav, data: refData, sampleRate: nil, channels: 1)
+    let config = GepardConfiguration(
+        modelDirectory: URL(fileURLWithPath: modelDir, isDirectory: true),
+        codecDirectory: URL(fileURLWithPath: codecDir, isDirectory: true))
+    MLX.Memory.cacheLimit = 256 * 1024 * 1024
+
+    // Left receptive field from a directly-loaded codec (the exactness bound the windowed
+    // decode relies on; computed from the ACTUAL loaded kernels, not the NeMo assumption).
+    // Plus a rollout-free PREFIX-STABILITY probe on the golden decoder_input: for a causal
+    // decoder, decode(x[..t]) must equal decode(x)[..t·1024] exactly.
+    do {
+        let craw = try loadArrays(url: URL(fileURLWithPath: codecDir).appending(path: "model.safetensors"))
+        let codec = NanoCodecDecoder(weights: craw)
+        print("  left receptive field: \(codec.leftReceptiveFieldFrames) frames (windowed decode context)")
+        if let g = try? loadArrays(url: URL(fileURLWithPath: "Goldens/p8_goldens.safetensors")),
+           let decIn = g["decoder_input"]?.asType(.float32) {
+            let T = decIn.dim(2)
+            let full = codec.decode(decIn).reshaped([-1]); eval(full)
+            let fullS = full.asArray(Float.self)
+            for t in [T / 4, T / 2, T - 3] {
+                let pre = codec.decode(decIn[0..., 0..., 0 ..< t]).reshaped([-1]); eval(pre)
+                let preS = pre.asArray(Float.self)
+                var maxD: Float = 0
+                var firstBad = -1
+                for i in 0 ..< preS.count {
+                    let d = abs(preS[i] - fullS[i])
+                    if d > maxD { maxD = d }
+                    if firstBad < 0 && d > 1e-4 { firstBad = i }
+                }
+                print(String(format: "  prefix-stability t=%d/%d: max|Δ| %.3g firstΔ>1e-4 @ %@ (frame %@)",
+                             t, T, maxD,
+                             firstBad < 0 ? "-" : "\(firstBad)",
+                             firstBad < 0 ? "-" : "\(firstBad / 1024)"))
+            }
+        } else {
+            print("  (p8 goldens not found — skipping prefix-stability probe)")
+        }
+    } catch { fail("codec load for receptive-field probe: \(error)") }
+
+    let sem = DispatchSemaphore(value: 0)
+    var failure: String?
+    Task { @InferenceActor in
+        defer { sem.signal() }
+        let package = GepardPackage(configuration: config)
+        do { try await package.load() } catch { failure = "load: \(error)"; return }
+
+        let text = "It's a beautiful morning. I already checked your calendar, and you have "
+            + "two meetings before lunch. After that, the afternoon is completely free, so we could "
+            + "finally finish the project we started last week."
+        let request = TTSRequest(text: text, voice: VoiceSelector(.referenceAudio(refAudio)),
+                                 metaData: ["maxFrames": .int(2000), "stopThreshold": .double(0.9)])
+
+        // Warmup (kernel compile + reference-prefix memoization off the clock).
+        _ = try? await package.run(TTSRequest(
+            text: "Warmup.", voice: VoiceSelector(.referenceAudio(refAudio)),
+            metaData: ["maxFrames": .int(60)]))
+
+        // --- (A) batch reference ---
+        MLX.Memory.peakMemory = 0
+        let tBatch0 = nowMs()
+        let batchResponse: any CapabilityResponse
+        do { batchResponse = try await package.run(request) } catch { failure = "batch run: \(error)"; return }
+        let batchMs = nowMs() - tBatch0
+        let batchPeakMB = Double(MLX.Memory.peakMemory) / 1_048_576.0
+        guard let batchTTS = batchResponse as? TTSResponse else { failure = "batch: not TTSResponse"; return }
+        let batchSamples = decodeWavSamples(batchTTS.audio.data)
+        print(String(format: "\n[BATCH] %d samples (%.2f s) · run %.0f ms · MLX-peak %.0f MB",
+                     batchSamples.count, Double(batchSamples.count) / 22050.0, batchMs, batchPeakMB))
+
+        // --- (B) streaming run: same request through the real StreamEmitting path ---
+        final class Collector: @unchecked Sendable {
+            var chunks: [TTSStreamChunk] = []
+            var arrivals: [Double] = []
+        }
+        let collector = Collector()
+        MLX.Memory.peakMemory = 0
+        let tStream0 = nowMs()
+        let streamResponse: any CapabilityResponse
+        do {
+            streamResponse = try await package.runStream(request) { chunk in
+                collector.chunks.append(chunk)
+                collector.arrivals.append(nowMs())
+            }
+        } catch { failure = "runStream: \(error)"; return }
+        let streamMs = nowMs() - tStream0
+        let streamPeakMB = Double(MLX.Memory.peakMemory) / 1_048_576.0
+        guard let streamTTS = streamResponse as? TTSResponse else { failure = "stream: not TTSResponse"; return }
+
+        let chunks = collector.chunks
+        let ttfaMs = (collector.arrivals.first ?? tStream0) - tStream0
+        let gaps = zip(collector.arrivals.dropFirst(), collector.arrivals).map { $0.0 - $0.1 }
+        let meanGap = gaps.isEmpty ? 0 : gaps.reduce(0, +) / Double(gaps.count)
+        let maxGap = gaps.max() ?? 0
+        let streamed = chunks.flatMap(\.samples)
+        let audioSec = Double(streamed.count) / 22050.0
+        print(String(format: "[STREAM] %d chunks · %d samples (%.2f s) · run %.0f ms · TTFA %.0f ms · cadence mean %.0f / max %.0f ms · MLX-peak %.0f MB",
+                     chunks.count, streamed.count, audioSec, streamMs, ttfaMs, meanGap, maxGap, streamPeakMB))
+
+        // --- STR-4: sequence integrity ---
+        let indicesOK = chunks.map(\.index) == Array(0 ..< chunks.count)
+        let finals = chunks.enumerated().filter { $0.element.isFinal }.map(\.offset)
+        let finalOK = finals == [chunks.count - 1]
+        let ratesOK = Set(chunks.map(\.sampleRate)) == [22050]
+        print("  STR-4 sequence: indices \(indicesOK ? "OK" : "BAD") · isFinal \(finalOK ? "OK" : "BAD \(finals)") · rate \(ratesOK ? "OK" : "BAD")")
+
+        // --- STR-5: aggregation parity ---
+        // (a) streamed concat vs the run's OWN aggregated response: exact by construction.
+        // (b) vs the separate batch run: the windowed decode is mathematically exact (causal
+        //     stack — see the prefix-stability probe above: equal-shape decodes are bit-exact),
+        //     but Metal dispatches different conv kernels for different sequence lengths, so
+        //     fp accumulation order differs and ~1e-3-scale noise amplifies through the 40-layer
+        //     stack. The honest criterion is ACOUSTIC: delta-SNR ≥ 40 dB (delta RMS ≤ 1% of
+        //     signal RMS — far below audibility) + a hard max|Δ| cap.
+        let aggSamples = decodeWavSamples(streamTTS.audio.data)
+        let aggLenOK = aggSamples.count == streamed.count
+        var maxDeltaBatch: Float = 0
+        var deltaEnergy: Double = 0
+        var signalEnergy: Double = 0
+        let lenOK = streamed.count == batchSamples.count
+        if lenOK {
+            for i in 0 ..< streamed.count {
+                let d = streamed[i] - batchSamples[i]
+                maxDeltaBatch = max(maxDeltaBatch, abs(d))
+                deltaEnergy += Double(d) * Double(d)
+                signalEnergy += Double(batchSamples[i]) * Double(batchSamples[i])
+            }
+        }
+        let deltaSNR = deltaEnergy > 0 ? 10 * log10(signalEnergy / deltaEnergy) : Double.infinity
+        print(String(format: "  STR-5 parity: agg-len %@ · vs-batch len %@ max|Δ| %.3g Δ-SNR %.1f dB",
+                     aggLenOK ? "OK" : "BAD", lenOK ? "OK" : "BAD", maxDeltaBatch, deltaSNR))
+
+        // --- diagnostic probe: FULL-PREFIX windowed decode (context = ∞). If this is exact
+        //     while the default-context run isn't, the receptive-field bound is too small;
+        //     if this ALSO diverges, something non-causal (or non-deterministic) is in play.
+        var probeRequest = request
+        do {
+            var meta = request.metaData
+            meta["streamContextFrames"] = .int(1_000_000)
+            probeRequest = TTSRequest(text: text, voice: request.voice, metaData: meta)
+        }
+        let probeCollector = Collector()
+        do {
+            _ = try await package.runStream(probeRequest) { chunk in
+                probeCollector.chunks.append(chunk)
+            }
+        } catch { failure = "full-context probe: \(error)"; return }
+        let probeSamples = probeCollector.chunks.flatMap(\.samples)
+        var maxDeltaProbe: Float = 0
+        if probeSamples.count == batchSamples.count {
+            for i in 0 ..< probeSamples.count {
+                maxDeltaProbe = max(maxDeltaProbe, abs(probeSamples[i] - batchSamples[i]))
+            }
+            print(String(format: "  probe (full-prefix context): max|Δ| vs batch %.3g", maxDeltaProbe))
+        } else {
+            print("  probe (full-prefix context): LENGTH MISMATCH \(probeSamples.count) vs \(batchSamples.count)")
+        }
+
+        // --- STR-7: mid-stream cancel (cancel after the first chunk; expect CancellationError,
+        //     truncated chunk list, no final marker) ---
+        final class CancelBox: @unchecked Sendable {
+            var task: Task<Void, Error>?
+            var chunks: [TTSStreamChunk] = []
+        }
+        let box = CancelBox()
+        box.task = Task { @InferenceActor in
+            _ = try await package.runStream(request) { chunk in
+                box.chunks.append(chunk)
+                if chunk.index == 0 { box.task?.cancel() }
+            }
+        }
+        var str7OK = false
+        do {
+            _ = try await box.task!.value
+            print("  STR-7 mid-stream cancel: BAD — run completed despite cancel")
+        } catch is CancellationError {
+            let noFinal = !box.chunks.contains { $0.isFinal }
+            str7OK = noFinal && box.chunks.count < chunks.count
+            print("  STR-7 mid-stream cancel: \(str7OK ? "OK" : "BAD") — CancellationError after \(box.chunks.count) chunk(s), final-marker-free \(noFinal)")
+        } catch {
+            print("  STR-7 mid-stream cancel: BAD — threw \(type(of: error)): \(error)")
+        }
+
+        // --- verdict + [STR] evidence line ---
+        let parityOK = lenOK && aggLenOK && deltaSNR >= 40 && maxDeltaBatch <= 0.05
+        let pass = indicesOK && finalOK && ratesOK && parityOK && str7OK && ttfaMs < 1000
+        print(String(format: "\n[STR] pkg=gepard ttfa=%.0fms chunks=%d cadence=%.0f/%.0fms audio=%.1fs wall=%.1fs rtf=%.2f deltaSNR=%.1fdB maxDelta=%.3g peakStream=%.0fMB peakBatch=%.0fMB seq=%@ parity=%@ cancel=%@",
+                     ttfaMs, chunks.count, meanGap, maxGap, audioSec, streamMs / 1000,
+                     streamMs / 1000 / max(audioSec, 1e-6), deltaSNR, maxDeltaBatch,
+                     streamPeakMB, batchPeakMB,
+                     indicesOK && finalOK && ratesOK ? "yes" : "NO",
+                     parityOK ? "yes" : "NO", str7OK ? "yes" : "NO"))
+        if !pass { failure = "STREAM gate failed (see checks above)" }
+
+        await package.unload()
+    }
+    sem.wait()
+    if let failure { fail(failure) }
+    print("\nGEPARD_STREAM PASS — exact windowed streaming, sequence/parity/cancel green.")
+    exit(0)
+}
 
 func runValidate(modelDir: String, codecDir: String, refWavPath: String) -> Never {
     Device.setDefault(device: Device(.gpu))

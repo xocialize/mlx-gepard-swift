@@ -191,4 +191,81 @@ public final class GepardModel {
         eval(wave)
         return wave.asArray(Float.self)
     }
+
+    // MARK: - Streaming synthesis (contract 1.25.0)
+
+    /// Chunk cadence for `synthesizeStreaming`. A small first chunk minimizes time-to-first-
+    /// audio (6 frames ≈ 280 ms of audio, ready ~100 ms after dispatch at gen-RTF ~0.25);
+    /// steady chunks trade emit overhead against latency.
+    public struct StreamingChunkOptions: Sendable {
+        public var firstChunkFrames: Int
+        public var chunkFrames: Int
+        /// Left-context frames for the windowed decode. nil = the decoder's computed
+        /// `leftReceptiveFieldFrames`. Diagnostic override (the --stream gate probes with
+        /// `.max` = full-prefix decode to isolate context-bound vs other divergence).
+        public var contextFrames: Int?
+        public init(firstChunkFrames: Int = 6, chunkFrames: Int = 12,
+                    contextFrames: Int? = nil) {
+            self.firstChunkFrames = firstChunkFrames
+            self.chunkFrames = chunkFrames
+            self.contextFrames = contextFrames
+        }
+    }
+
+    /// Streaming synthesis: identical AR rollout to `synthesize`, but the NanoCodec decode is
+    /// **windowed and incremental** — every chunk of committed frames is decoded with
+    /// `leftReceptiveFieldFrames` of left context (re-decoded and trimmed), which is EXACT
+    /// because the whole decoder stack is causal. Emits per-chunk samples via `onChunk`
+    /// (called synchronously from the run loop — the `StreamEmitting` contract); `isFinal` on
+    /// exactly the last emission (possibly empty when the stop lands on a chunk boundary).
+    /// Returns the full concatenated waveform (== the streamed samples, by construction).
+    ///
+    /// Bonus over the batch path: the decode transient is bounded by the window size instead
+    /// of scaling with utterance length (the plan's "V2 frame-streaming decode").
+    public func synthesizeStreaming(
+        prefix: MLXArray, condIds: [Int], options: GepardDecoder.Options,
+        chunking: StreamingChunkOptions = StreamingChunkOptions(),
+        onChunk: (_ samples: [Float], _ isFinal: Bool) -> Void,
+        cancelCheck: (() throws -> Void)? = nil, onFrame: ((Int) -> Void)? = nil
+    ) rethrows -> [Float] {
+        let context = chunking.contextFrames ?? codecDecoder.leftReceptiveFieldFrames
+        var frames: [[Int]] = []
+        var emittedFrames = 0
+        var nextEmit = max(1, chunking.firstChunkFrames)
+        var allSamples: [Float] = []
+
+        func decodeWindow(upTo end: Int) -> [Float] {
+            let ctx = min(emittedFrames, context)
+            let window = Array(frames[(emittedFrames - ctx) ..< end])
+            let wave = codecDecoder.decode(codesToDecoderInput(window)).reshaped([-1])
+            eval(wave)
+            return Array(wave.asArray(Float.self).dropFirst(ctx * Self.samplesPerFrame))
+        }
+
+        let ids = MLXArray(condIds.map { Int32($0) })
+        // `onFrameCodes` is an optional (hence escaping) parameter, but the rollout only ever
+        // calls it synchronously before returning — safe to lend the non-escaping `onChunk` in.
+        try withoutActuallyEscaping(onChunk) { onChunk in
+            _ = try decoder.rollout(
+                prefix: prefix, condIds: ids, options: options,
+                cancelCheck: cancelCheck, onFrame: onFrame,
+                onFrameCodes: { codes in
+                    frames.append(codes)
+                    if frames.count >= nextEmit {
+                        let samples = decodeWindow(upTo: frames.count)
+                        allSamples += samples
+                        onChunk(samples, false)
+                        emittedFrames = frames.count
+                        nextEmit = emittedFrames + max(1, chunking.chunkFrames)
+                    }
+                })
+        }
+
+        // Final flush: the remainder after the stop head fired (empty when the stop landed
+        // exactly on a chunk boundary — still emitted, carrying the isFinal marker).
+        let tail = frames.count > emittedFrames ? decodeWindow(upTo: frames.count) : []
+        allSamples += tail
+        onChunk(tail, true)
+        return allSamples
+    }
 }

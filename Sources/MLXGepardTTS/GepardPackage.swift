@@ -29,7 +29,7 @@ import MLXToolKit
 ///   argmax, so the seed is currently a no-op — accepted for forward-compat when a temperature
 ///   sampling path lands.
 @InferenceActor
-public final class GepardPackage: ModelPackage {
+public final class GepardPackage: ModelPackage, StreamEmitting {
     public typealias Configuration = GepardConfiguration
 
     /// Split footprints — MEASURED via the headless GEPARD_VALIDATE harness (gepard-gates
@@ -77,8 +77,11 @@ public final class GepardPackage: ModelPackage {
                     summary: "Gepard-1.0 zero-shot voice-cloning streaming TTS (.wav, 22.05 kHz "
                         + "mono). Realtime companion voice (~5× realtime, ~22 ms TTFA) cloned from "
                         + "a reference clip. Requires voice.referenceAudio (no preset voices). "
-                        + "Onset text-CFG (metaData.cfgScale) rescues 1–2-word utterances.",
-                    modes: [.neutral, .expressive]
+                        + "Onset text-CFG (metaData.cfgScale) rescues 1–2-word utterances. "
+                        + "Streams PCM chunks (contract 1.25.0): first audio ≈ 6 frames / 280 ms "
+                        + "of speech, exact windowed causal decode.",
+                    modes: [.neutral, .expressive],
+                    streaming: .audioChunk
                 )
             ]
         )
@@ -140,6 +143,82 @@ public final class GepardPackage: ModelPackage {
         // throwing `cancelCheck` closure threaded into GepardModel.synthesize, rethrowing the
         // CancellationError unchanged so the engine can classify user-cancel vs governor-preempt.
         try Task.checkCancellation()
+        let (model, prefix, condIds, options) = try conditioning(for: request)
+        try Task.checkCancellation()
+
+        // Rollout → dequant → vocode. Per-frame cancellation + progress at the generation seam.
+        let samples = try model.synthesize(
+            prefix: prefix, condIds: condIds, options: options,
+            cancelCheck: { try Task.checkCancellation() },
+            onFrame: { count in RunProgress.report(.generate, step: count) })
+
+        try Task.checkCancellation()
+        RunProgress.report(.decode)
+        let wav = AudioSupport.encodeWAV16(samples: samples, sampleRate: GepardModel.sampleRate)
+        return TTSResponse(audio: Audio(
+            format: .wav, data: wav, sampleRate: GepardModel.sampleRate, channels: 1))
+    }
+
+    // MARK: - Streaming (contract 1.25.0, StreamEmitting)
+
+    /// Streaming twin of `run()`: same conditioning, same AR rollout, but the NanoCodec decode
+    /// is windowed + incremental (exact — the decoder stack is causal), with each chunk handed
+    /// to `emit` synchronously from the run loop. Returns the same aggregated `.wav` response
+    /// `run()` would have produced (STR-5 parity).
+    public func runStream(_ request: any CapabilityRequest,
+                          emit: @escaping @Sendable (TTSStreamChunk) -> Void)
+        async throws -> any CapabilityResponse {
+        try Task.checkCancellation()   // STR-2: entry checkpoint precedes the first emit
+        let (model, prefix, condIds, options) = try conditioning(for: request)
+        try Task.checkCancellation()
+
+        // Streaming cadence knobs (metaData plane, all optional): chunk sizes trade emit
+        // overhead vs latency; `streamContextFrames` is the windowed-decode context override
+        // (diagnostic — the --stream gate's full-prefix probe; default = computed receptive
+        // field).
+        var chunking = GepardModel.StreamingChunkOptions()
+        if let v = tts(request)?.metaData.intValue("streamFirstChunkFrames") {
+            chunking.firstChunkFrames = max(1, v)
+        }
+        if let v = tts(request)?.metaData.intValue("streamChunkFrames") {
+            chunking.chunkFrames = max(1, v)
+        }
+        if let v = tts(request)?.metaData.intValue("streamContextFrames") {
+            chunking.contextFrames = max(0, v)
+        }
+
+        var chunkIndex = 0
+        let samples = try model.synthesizeStreaming(
+            prefix: prefix, condIds: condIds, options: options,
+            chunking: chunking,
+            onChunk: { chunkSamples, isFinal in
+                emit(TTSStreamChunk(samples: chunkSamples,
+                                    sampleRate: GepardModel.sampleRate,
+                                    index: chunkIndex, isFinal: isFinal))
+                chunkIndex += 1
+            },
+            cancelCheck: { try Task.checkCancellation() },
+            onFrame: { count in RunProgress.report(.generate, step: count) })
+
+        try Task.checkCancellation()
+        RunProgress.report(.postprocess)
+        let wav = AudioSupport.encodeWAV16(samples: samples, sampleRate: GepardModel.sampleRate)
+        return TTSResponse(audio: Audio(
+            format: .wav, data: wav, sampleRate: GepardModel.sampleRate, channels: 1))
+    }
+
+    /// Typed view of a request for the metaData plane (nil for non-TTS requests, which
+    /// `conditioning` already rejected).
+    private func tts(_ request: any CapabilityRequest) -> TTSRequest? {
+        request as? TTSRequest
+    }
+
+    // MARK: - Shared conditioning (run + runStream)
+
+    /// Voice guard → memoized speaker prefix → cond_ids → metaData-plane options. Shared by
+    /// `run()` and `runStream()` so the two paths cannot drift.
+    private func conditioning(for request: any CapabilityRequest) throws
+        -> (model: GepardModel, prefix: MLXArray, condIds: [Int], options: GepardDecoder.Options) {
         guard let model else { throw PackageError.notLoaded }
         guard request.capability == .tts, let tts = request as? TTSRequest else {
             throw PackageError.unsupportedCapability(request.capability)
@@ -167,7 +246,6 @@ public final class GepardPackage: ModelPackage {
             prefix = p
             cachedReference = (key, p)
         }
-        try Task.checkCancellation()
 
         // Text → cond_ids (P10-validated conditioner).
         let condIds = model.conditioner.condIds(for: tts.text)
@@ -191,18 +269,7 @@ public final class GepardPackage: ModelPackage {
             options.cfgFrames = tts.metaData.intValue("cfgFrames") ?? 20
             options.uncondIds = [GepardConditioner.sot, GepardConditioner.eot, GepardConditioner.sos]
         }
-
-        // Rollout → dequant → vocode. Per-frame cancellation + progress at the generation seam.
-        let samples = try model.synthesize(
-            prefix: prefix, condIds: condIds, options: options,
-            cancelCheck: { try Task.checkCancellation() },
-            onFrame: { count in RunProgress.report(.generate, step: count) })
-
-        try Task.checkCancellation()
-        RunProgress.report(.decode)
-        let wav = AudioSupport.encodeWAV16(samples: samples, sampleRate: GepardModel.sampleRate)
-        return TTSResponse(audio: Audio(
-            format: .wav, data: wav, sampleRate: GepardModel.sampleRate, channels: 1))
+        return (model, prefix, condIds, options)
     }
 
     /// In-memory cache key for a reference clip (Hasher is per-process seeded, which is all we

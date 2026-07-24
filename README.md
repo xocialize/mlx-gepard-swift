@@ -20,6 +20,10 @@ text ──▶ Qwen3.5 tokenizer ──▶ cond_ids ─────────�
   *deterministic and consistent* per clip.
 - **Realtime + streaming-first**: measured gen-RTF **0.24 (4.2× realtime)**, TTFA **17 ms** on an
   M5 Max (fp32 unoptimized).
+- **True PCM streaming** (engine contract 1.25.0, `StreamEmitting`): first audio ≈ **100 ms**
+  after dispatch — chunked **exact** windowed causal NanoCodec decode (the decoder stack is
+  fully causal; 26-frame left context, computed from the loaded kernels). Bonus: the decode
+  transient is bounded by the window (measured 2.35 vs 4.86 GB whole-utterance).
 - **Small footprint**: **~1.2 GB resident** (bf16 language model + fp32 codec) — fits every tier.
 - **Two permissive weight layers** ⇒ ships under MLXEngine's default `.permissiveOnly` policy
   (no acknowledgement flow): language model **Apache-2.0**, NanoCodec **NVIDIA Open Model License**.
@@ -89,6 +93,9 @@ internally) and its prepared speaker prefix is memoized per clip for long-form/m
 | `cfgFrames` | int | 20 | Onset window CFG is applied over. |
 | `maxFrames` | int | 2000 (~93 s) | Hard generation cap. |
 | `stopThreshold` | double | 0.5 | Sigmoid threshold on the stop head (oracle `stop_threshold`). Prefix-conditioned — some reference clips cross 0.5 at a sentence pause and truncate multi-sentence text; 0.7–0.9 rescues those. |
+| `streamFirstChunkFrames` | int | 6 | Streaming only: frames in the first emitted chunk (≈280 ms of audio — the TTFA lever). |
+| `streamChunkFrames` | int | 12 | Streaming only: steady chunk cadence (≈558 ms of audio per chunk). |
+| `streamContextFrames` | int | *(computed)* | Streaming only: windowed-decode left context override (diagnostic; default = the decoder's computed receptive field). |
 | `seed` | int | — | Reserved (V1 decoding is deterministic greedy — currently a no-op). |
 
 > **On CFG:** onset-CFG rescues many short utterances but is **not universally safe** per-clip
@@ -140,6 +147,7 @@ swift run -c release gepard-gates --p2      # CodecOps + text-repetition, bit-ex
                                   --p8       # full-pipeline GPU smoke (RTF/TTFA)
                                   --p10      # tokenizer → cond_ids, INTEGER-EXACT
                                   --validate # headless engine run() harness (footprint/dBFS/RTF)
+                                  --stream   # streaming gate: STR-4/5/7 live + TTFA/cadence + prefix-stability
                                   --ab-dtype # bf16-vs-fp32 rollout A/B
 ```
 
