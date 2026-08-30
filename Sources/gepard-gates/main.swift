@@ -117,6 +117,102 @@ if args.contains("--validate") {
         ?? (NSHomeDirectory() + "/Development/mlxengine-audio/WIP/gepard/oracle-capture/extra_ref_audio/roxy_a1.wav")
     runValidate(modelDir: modelDir, codecDir: codecDir, refWavPath: refWav)  // exits
 }
+if args.contains("--probe") {
+    // Truncation probe: emitted seconds for a 3-sentence text across stopThreshold values.
+    // Added debugging the ML[X] Audio Studio Converse truncation (synthetic references
+    // push the prefix-conditioned stop head past even the audited 0.9).
+    let pos = args.dropFirst().filter { !$0.hasPrefix("--") }
+    guard pos.count >= 3 else { fail("--probe <modelDir> <codecDir> <refWav>") }
+    Device.setDefault(device: Device(.gpu))
+    guard let refData = FileManager.default.contents(atPath: pos[2]) else {
+        fail("reference wav not found at \(pos[2])")
+    }
+    let refAudio = Audio(format: .wav, data: refData, sampleRate: nil, channels: 1)
+    let config = GepardConfiguration(
+        modelDirectory: URL(fileURLWithPath: pos[0], isDirectory: true),
+        codecDirectory: URL(fileURLWithPath: pos[1], isDirectory: true))
+    MLX.Memory.cacheLimit = 256 * 1024 * 1024
+    let sem = DispatchSemaphore(value: 0)
+    Task { @InferenceActor in
+        defer { sem.signal() }
+        let package = GepardPackage(configuration: config)
+        do { try await package.load() } catch { print("PROBE load fail: \(error)"); return }
+        // GEPARD_PROBE_TEXTS ("|"-separated) runs texts SEQUENTIALLY in one process —
+        // the voice-chat per-sentence sequence, where the field failure is "utterance 1
+        // full, utterance 2 stops at frame ~2". GEPARD_PROBE_STREAM=1 uses runStream
+        // (the engine.stream path the app takes); default stays batch run().
+        let env = ProcessInfo.processInfo.environment
+        let texts: [String]
+        if let multi = env["GEPARD_PROBE_TEXTS"] {
+            texts = multi.split(separator: "|").map(String.init)
+        } else {
+            texts = [env["GEPARD_PROBE_TEXT"]
+                ?? "It's a beautiful morning. I already checked your calendar, and you have "
+                + "two meetings before lunch. After that, the afternoon is completely free, so we "
+                + "could finally finish the project we started last week."]
+        }
+        let useStream = env["GEPARD_PROBE_STREAM"] == "1"
+        let noMaxFrames = env["GEPARD_PROBE_NO_MAXFRAMES"] == "1"   // kit parity: metaData has no maxFrames
+        let sweep = (env["GEPARD_PROBE_SWEEP"] ?? "0.9")
+            .split(separator: ",").compactMap { Double($0) }
+        for threshold in sweep {
+            for (index, text) in texts.enumerated() {
+                var meta: MetaData = ["stopThreshold": .double(threshold)]
+                if !noMaxFrames { meta["maxFrames"] = .int(2000) }
+                let request = TTSRequest(text: text,
+                                         voice: VoiceSelector(.referenceAudio(refAudio)),
+                                         metaData: meta)
+                do {
+                    let seconds: Double
+                    if useStream, let streamer = package as (any StreamEmitting)? {
+                        var all: [Float] = []
+                        var boundaries: [Int] = []
+                        var rate = 22_050
+                        _ = try await streamer.runStream(request) { chunk in
+                            all.append(contentsOf: chunk.samples)
+                            boundaries.append(all.count)
+                            rate = chunk.sampleRate
+                        }
+                        seconds = Double(all.count) / Double(rate)
+                        // GEPARD_PROBE_DUMP=<dir>: stream-concat WAV + chunk boundaries +
+                        // the batch render of the SAME request — decode-path comparison
+                        // (chunk-edge artifacts live in the delta between the two).
+                        if let dir = env["GEPARD_PROBE_DUMP"] {
+                            let base = "\(dir)/seq\(index)"
+                            var pcm = Data()
+                            for x in all {
+                                let v = Int16(max(-32768, min(32767, Int(x * 32767))))
+                                pcm.append(UInt8(truncatingIfNeeded: v))
+                                pcm.append(UInt8(truncatingIfNeeded: v >> 8))
+                            }
+                            var wav = Data("RIFF".utf8)
+                            func le32(_ v: Int) -> Data { withUnsafeBytes(of: UInt32(v).littleEndian) { Data($0) } }
+                            func le16(_ v: Int) -> Data { withUnsafeBytes(of: UInt16(v).littleEndian) { Data($0) } }
+                            wav += le32(36 + pcm.count) + Data("WAVEfmt ".utf8) + le32(16)
+                            wav += le16(1) + le16(1) + le32(rate) + le32(rate * 2) + le16(2) + le16(16)
+                            wav += Data("data".utf8) + le32(pcm.count) + pcm
+                            try? wav.write(to: URL(fileURLWithPath: base + "-stream.wav"))
+                            try? boundaries.map(String.init).joined(separator: "\n")
+                                .write(toFile: base + "-boundaries.txt", atomically: true, encoding: .utf8)
+                            let batch = try await package.run(request) as! TTSResponse
+                            try? batch.audio.data.write(to: URL(fileURLWithPath: base + "-batch.wav"))
+                        }
+                    } else {
+                        let response = try await package.run(request) as! TTSResponse
+                        let rate = response.audio.sampleRate ?? 22_050
+                        seconds = Double(max(0, response.audio.data.count - 44)) / 2.0 / Double(rate)
+                    }
+                    print(String(format: "PROBE t=%.2f %@ seq[%d] → %6.2f s  \"%@\"",
+                                 threshold, useStream ? "stream" : "batch ", index, seconds,
+                                 String(text.prefix(34))))
+                } catch { print("PROBE t=\(threshold) seq[\(index)] error: \(error)") }
+            }
+        }
+    }
+    sem.wait()
+    exit(0)
+}
+
 if args.contains("--stream") {
     let pos = args.dropFirst().filter { !$0.hasPrefix("--") }
     let modelDir = pos.first ?? (NSHomeDirectory() + "/Development/_gepard-oracle/gepard_ckpt")
@@ -901,8 +997,13 @@ func runStreamGate(modelDir: String, codecDir: String, refWavPath: String) -> Ne
         let text = "It's a beautiful morning. I already checked your calendar, and you have "
             + "two meetings before lunch. After that, the afternoon is completely free, so we could "
             + "finally finish the project we started last week."
+        let stopThreshold = ProcessInfo.processInfo.environment["GEPARD_STOP_THRESHOLD"]
+            .flatMap(Double.init) ?? 0.9
+        print(String(format: "  stopThreshold: %.2f%@", stopThreshold,
+                     stopThreshold == 0.9 ? "" : " (env override)"))
         let request = TTSRequest(text: text, voice: VoiceSelector(.referenceAudio(refAudio)),
-                                 metaData: ["maxFrames": .int(2000), "stopThreshold": .double(0.9)])
+                                 metaData: ["maxFrames": .int(2000),
+                                            "stopThreshold": .double(stopThreshold)])
 
         // Warmup (kernel compile + reference-prefix memoization off the clock).
         _ = try? await package.run(TTSRequest(
