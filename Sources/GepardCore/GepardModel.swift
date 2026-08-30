@@ -178,10 +178,30 @@ public final class GepardModel {
     /// Full synthesis from a prepared speaker prefix + cond ids → mono 22.05 kHz samples.
     /// `cancelCheck` fires per generated frame (rethrown unchanged); `onFrame(count)` reports
     /// progress. `options` carries maxFrames + the onset-CFG knob.
+    /// One synthesis outcome: the samples, plus whether the decode was STILLBORN — it
+    /// ended at/near the stop floor with essentially no audio energy (the model never began
+    /// speaking; AB-L-0075). Judged by ENERGY, not the stop-head trajectory: onset-high
+    /// heads occur in healthy runs, near-threshold wiggles in stillborn ones.
+    public struct Synthesis {
+        public let samples: [Float]
+        public let saturated: Bool
+    }
+
+    /// RMS below this (int16-normalized floats) is silence: measured stillborn output sits
+    /// at ~0.0001 RMS; quiet real speech at 0.04+.
+    private static let stillbornRMSFloor: Float = 0.005
+
+    private static func isSilence(_ samples: [Float]) -> Bool {
+        guard !samples.isEmpty else { return true }
+        var acc: Float = 0
+        for v in samples { acc += v * v }
+        return (acc / Float(samples.count)).squareRoot() < stillbornRMSFloor
+    }
+
     public func synthesize(
         prefix: MLXArray, condIds: [Int], options: GepardDecoder.Options,
         cancelCheck: (() throws -> Void)? = nil, onFrame: ((Int) -> Void)? = nil
-    ) rethrows -> [Float] {
+    ) rethrows -> Synthesis {
         let ids = MLXArray(condIds.map { Int32($0) })
         let rollout = try decoder.rollout(
             prefix: prefix, condIds: ids, options: options,
@@ -189,7 +209,14 @@ public final class GepardModel {
         let decoderInput = codesToDecoderInput(rollout.codes)        // [1, 32, T]
         let wave = codecDecoder.decode(decoderInput).reshaped([-1])  // [T*1024]
         eval(wave)
-        return wave.asArray(Float.self)
+        let samples = wave.asArray(Float.self)
+        // Stillborn verdict: silence-only output is stillborn regardless of where the stop
+        // landed — no legitimate decode is all-silence (field: stillborn RMS ~0.0001 vs
+        // real speech 0.04+, at any length observed).
+        if Self.isSilence(samples) {
+            return Synthesis(samples: [], saturated: true)
+        }
+        return Synthesis(samples: samples, saturated: false)
     }
 
     // MARK: - Streaming synthesis (contract 1.25.0)
@@ -227,11 +254,14 @@ public final class GepardModel {
         chunking: StreamingChunkOptions = StreamingChunkOptions(),
         onChunk: (_ samples: [Float], _ isFinal: Bool) -> Void,
         cancelCheck: (() throws -> Void)? = nil, onFrame: ((Int) -> Void)? = nil
-    ) rethrows -> [Float] {
+    ) rethrows -> Synthesis {
         let context = chunking.contextFrames ?? codecDecoder.leftReceptiveFieldFrames
         var frames: [[Int]] = []
         var emittedFrames = 0
-        var nextEmit = max(1, chunking.firstChunkFrames)
+        // Emission holds until past the stop floor: a stillborn decode ends there, so its
+        // silence is judged (and discarded) before anything reaches the consumer, and the
+        // caller can retry with a perturbed prefix as if this attempt never played.
+        var nextEmit = max(max(1, chunking.firstChunkFrames), options.minFrames + 12)
         var allSamples: [Float] = []
 
         func decodeWindow(upTo end: Int) -> [Float] {
@@ -261,11 +291,22 @@ public final class GepardModel {
                 })
         }
 
+        // Stillborn verdict BEFORE the tail flush: the decode ended before anything was
+        // emitted (stillborn stops land just past the floor, inside the emission gate) and
+        // it is silence → to the consumer this attempt never existed; the caller retries.
+        if emittedFrames == 0, !frames.isEmpty {
+            let probe = decodeWindow(upTo: frames.count)
+            if Self.isSilence(probe) { return Synthesis(samples: [], saturated: true) }
+            allSamples += probe
+            onChunk(probe, false)
+            emittedFrames = frames.count
+        }
+
         // Final flush: the remainder after the stop head fired (empty when the stop landed
         // exactly on a chunk boundary — still emitted, carrying the isFinal marker).
         let tail = frames.count > emittedFrames ? decodeWindow(upTo: frames.count) : []
         allSamples += tail
         onChunk(tail, true)
-        return allSamples
+        return Synthesis(samples: allSamples, saturated: false)
     }
 }

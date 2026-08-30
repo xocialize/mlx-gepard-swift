@@ -91,12 +91,24 @@ internally) and its prepared speaker prefix is memoized per clip for long-form/m
 |---|---|---|---|
 | `cfgScale` | double | *(off)* | Onset text-CFG weight `w` (tech-report §5.3 short-utterance rescue). Absent ⇒ the plain greedy path. |
 | `cfgFrames` | int | 20 | Onset window CFG is applied over. |
-| `maxFrames` | int | 2000 (~93 s) | Hard generation cap. |
+| `maxFrames` | int | ~2.5×chars+60 | Generation cap. Default scales with the text (a decode with no honored stop crossing — e.g. trailing babble at high thresholds — is bounded at ~2.5× a typical read instead of filling 2000 frames / ~93 s). Explicit value wins; 2000 is the hard ceiling. |
 | `stopThreshold` | double | 0.5 | Sigmoid threshold on the stop head (oracle `stop_threshold`). Prefix-conditioned — some reference clips cross 0.5 at a sentence pause and truncate multi-sentence text; 0.7–0.9 rescues those. |
+| `minFrames` | int | max(8, cond tokens) | Stop-head floor: crossings inside the first frames are never a real end of speech — ignored (AB-L-0075). |
+| `stopRescueAttempts` | int | 3 | Stillborn-decode rescue budget. Some (reference clip, text) pairs decode to pure silence with the stop head saturated — deterministically (greedy decode), at ANY threshold. Each rescue re-encodes the reference with a −0.2 dB gain nudge (identity-preserving, memoized) and retries; streaming emits nothing for a stillborn attempt, so retries are invisible downstream. 0 disables. |
 | `streamFirstChunkFrames` | int | 6 | Streaming only: frames in the first emitted chunk (≈280 ms of audio — the TTFA lever). |
 | `streamChunkFrames` | int | 12 | Streaming only: steady chunk cadence (≈558 ms of audio per chunk). |
 | `streamContextFrames` | int | *(computed)* | Streaming only: windowed-decode left context override (diagnostic; default = the decoder's computed receptive field). |
 | `seed` | int | — | Reserved (V1 decoding is deterministic greedy — currently a no-op). |
+
+> **On stillborn decodes (v0.4.0):** the failure mode behind "the second sentence never got
+> spoken" in the field: for some (reference clip, text) pairs — synthetic/re-rendered clips
+> especially — the decode emits silence from frame one and the stop head crosses immediately.
+> Greedy decode makes it deterministic: retrying the same request can never differ, and no
+> `stopThreshold` fixes it. v0.4.0 detects it by ENERGY (silence-only output judged at the
+> stop floor, before anything is emitted) and retries with a tiny deterministic gain nudge on
+> the reference — field texts that stillborn'd at 0.9 now render verbatim (ASR-verified).
+> Streaming TTFA moved ~280 ms → ~790 ms: the first chunk holds until the verdict window
+> (floor + 12 frames) so a stillborn attempt can be discarded silently.
 
 > **On CFG:** onset-CFG rescues many short utterances but is **not universally safe** per-clip
 > (e.g. some 1–2-word inputs collapse to silence at `w=2.6`, consistent with the tech report's

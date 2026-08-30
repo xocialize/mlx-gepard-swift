@@ -3,6 +3,7 @@ import GepardCore
 import MLX
 import MLXRandom
 import MLXToolKit
+import OSLog
 
 /// Gepard-1.0 on the canonical `tts` surface: zero-shot voice cloning from a reference clip,
 /// with a streaming-first architecture (5.3× realtime, 22 ms TTFA — a companion/realtime
@@ -93,7 +94,11 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
     // the SAME reference for every line; preparing it re-runs the codec encoder + Q-Former.
     // Memoize the frozen speaker prefix keyed by the reference clip bytes. Safe to hold:
     // InferenceActor serializes run(), and the prefix is read-only once built.
-    private var cachedReference: (key: Int, prefix: MLXArray)?
+    /// Memoized speaker prefixes, keyed by (reference bytes, rescue nudge). Nudge 0 is the
+    /// clip as given; nudge k re-encodes with a small deterministic gain change (AB-L-0075
+    /// stillborn-decode rescue). Bounded — cleared on unload, and tiny in practice.
+    private var cachedPrefixes: [String: MLXArray] = [:]
+    private static let rescueLog = Logger(subsystem: "MLXGepardTTS", category: "rescue")
 
     public nonisolated init(configuration: Configuration) {
         self.configuration = configuration
@@ -131,7 +136,7 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
 
     public func unload() async {
         model = nil
-        cachedReference = nil
+        cachedPrefixes.removeAll()
         MLX.Memory.clearCache()   // release the retained MLX pool so eviction frees RSS
     }
 
@@ -143,14 +148,33 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
         // throwing `cancelCheck` closure threaded into GepardModel.synthesize, rethrowing the
         // CancellationError unchanged so the engine can classify user-cancel vs governor-preempt.
         try Task.checkCancellation()
-        let (model, prefix, condIds, options) = try conditioning(for: request)
+        let (model, prefix, condIds, options, clip, rescueAttempts) = try conditioning(for: request)
         try Task.checkCancellation()
 
-        // Rollout → dequant → vocode. Per-frame cancellation + progress at the generation seam.
-        let samples = try model.synthesize(
-            prefix: prefix, condIds: condIds, options: options,
-            cancelCheck: { try Task.checkCancellation() },
-            onFrame: { count in RunProgress.report(.generate, step: count) })
+        // Rollout → dequant → vocode, with the stillborn-decode rescue loop (AB-L-0075):
+        // a saturated attempt produced nothing; re-encode the reference with a tiny gain
+        // nudge (deterministic, identity-preserving) and try again.
+        var samples: [Float] = []
+        for attempt in 0 ... rescueAttempts {
+            let attemptPrefix = attempt == 0 ? prefix
+                : try speakerPrefix(for: clip, nudge: attempt)
+            let synthesis = try model.synthesize(
+                prefix: attemptPrefix, condIds: condIds, options: options,
+                cancelCheck: { try Task.checkCancellation() },
+                onFrame: { count in RunProgress.report(.generate, step: count) })
+            if !synthesis.saturated {
+                if attempt > 0 {
+                    Self.rescueLog.info("stillborn decode rescued at nudge \(attempt)")
+                }
+                samples = synthesis.samples
+                break
+            }
+            if attempt == rescueAttempts {
+                Self.rescueLog.error("stillborn decode persisted through \(rescueAttempts) nudges — emitting silence")
+            } else {
+                Self.rescueLog.info("stillborn decode (attempt \(attempt)) — nudging reference")
+            }
+        }
 
         try Task.checkCancellation()
         RunProgress.report(.decode)
@@ -169,7 +193,7 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
                           emit: @escaping @Sendable (TTSStreamChunk) -> Void)
         async throws -> any CapabilityResponse {
         try Task.checkCancellation()   // STR-2: entry checkpoint precedes the first emit
-        let (model, prefix, condIds, options) = try conditioning(for: request)
+        let (model, prefix, condIds, options, clip, rescueAttempts) = try conditioning(for: request)
         try Task.checkCancellation()
 
         // Streaming cadence knobs (metaData plane, all optional): chunk sizes trade emit
@@ -188,17 +212,38 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
         }
 
         var chunkIndex = 0
-        let samples = try model.synthesizeStreaming(
-            prefix: prefix, condIds: condIds, options: options,
-            chunking: chunking,
-            onChunk: { chunkSamples, isFinal in
-                emit(TTSStreamChunk(samples: chunkSamples,
-                                    sampleRate: GepardModel.sampleRate,
-                                    index: chunkIndex, isFinal: isFinal))
-                chunkIndex += 1
-            },
-            cancelCheck: { try Task.checkCancellation() },
-            onFrame: { count in RunProgress.report(.generate, step: count) })
+        // Stillborn-decode rescue (AB-L-0075): a saturated attempt emits NOTHING (the model
+        // layer gates emission past the probe window), so retrying is invisible downstream.
+        var samples: [Float] = []
+        for attempt in 0 ... rescueAttempts {
+            let attemptPrefix = attempt == 0 ? prefix
+                : try speakerPrefix(for: clip, nudge: attempt)
+            let synthesis = try model.synthesizeStreaming(
+                prefix: attemptPrefix, condIds: condIds, options: options,
+                chunking: chunking,
+                onChunk: { chunkSamples, isFinal in
+                    emit(TTSStreamChunk(samples: chunkSamples,
+                                        sampleRate: GepardModel.sampleRate,
+                                        index: chunkIndex, isFinal: isFinal))
+                    chunkIndex += 1
+                },
+                cancelCheck: { try Task.checkCancellation() },
+                onFrame: { count in RunProgress.report(.generate, step: count) })
+            if !synthesis.saturated {
+                if attempt > 0 {
+                    Self.rescueLog.info("stillborn decode rescued at nudge \(attempt)")
+                }
+                samples = synthesis.samples
+                break
+            }
+            if attempt == rescueAttempts {
+                Self.rescueLog.error("stillborn decode persisted through \(rescueAttempts) nudges — emitting silence")
+                emit(TTSStreamChunk(samples: [], sampleRate: GepardModel.sampleRate,
+                                    index: chunkIndex, isFinal: true))
+            } else {
+                Self.rescueLog.info("stillborn decode (attempt \(attempt)) — nudging reference")
+            }
+        }
 
         try Task.checkCancellation()
         RunProgress.report(.postprocess)
@@ -218,7 +263,8 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
     /// Voice guard → memoized speaker prefix → cond_ids → metaData-plane options. Shared by
     /// `run()` and `runStream()` so the two paths cannot drift.
     private func conditioning(for request: any CapabilityRequest) throws
-        -> (model: GepardModel, prefix: MLXArray, condIds: [Int], options: GepardDecoder.Options) {
+        -> (model: GepardModel, prefix: MLXArray, condIds: [Int], options: GepardDecoder.Options,
+            clip: Audio, rescueAttempts: Int) {
         guard let model else { throw PackageError.notLoaded }
         guard request.capability == .tts, let tts = request as? TTSRequest else {
             throw PackageError.unsupportedCapability(request.capability)
@@ -230,22 +276,8 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
                 "voice — Gepard has no preset voices; provide voice.referenceAudio")
         }
 
-        // Reference conditioning → frozen speaker prefix (memoized per reference clip bytes).
-        let key = Self.referenceKey(referenceClip.data)
-        let prefix: MLXArray
-        if let cached = cachedReference, cached.key == key {
-            prefix = cached.prefix
-        } else {
-            RunProgress.report(.encode)
-            let (mono, sourceRate) = try AudioSupport.decodeToMono(referenceClip)
-            let samples22k = SincResampler.resample(
-                audio: mono, from: sourceRate, to: GepardModel.sampleRate)
-            let refCodes = model.encodeReference(samples: samples22k)
-            let p = model.voicePrefix(refCodes: refCodes)
-            eval(p)
-            prefix = p
-            cachedReference = (key, p)
-        }
+        // Reference conditioning → frozen speaker prefix (memoized per clip bytes + nudge).
+        let prefix = try speakerPrefix(for: referenceClip, nudge: 0)
 
         // Text → cond_ids (P10-validated conditioner).
         let condIds = model.conditioner.condIds(for: tts.text)
@@ -256,7 +288,13 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
             // greedy decoding, wired for a future temperature path.
             MLXRandom.seed(UInt64(bitPattern: Int64(seed)) & 0xFFFF_FFFF)
         }
-        let maxFrames = tts.metaData.intValue("maxFrames") ?? 2000
+        // Default frame budget scales with the text: typical speech runs ~1.4–2.2 frames
+        // per character, so ~2.5×chars + 60 is a generous ceiling that still stops a
+        // runaway decode (no honored stop-head crossing — e.g. trailing babble at high
+        // thresholds) from filling the full 2000-frame cap (~93 s). Explicit "maxFrames"
+        // always wins.
+        let derivedCap = min(2000, Int(Double(tts.text.count) * 2.5) + 60)
+        let maxFrames = tts.metaData.intValue("maxFrames") ?? derivedCap
         var options = GepardDecoder.Options(maxFrames: max(1, maxFrames))
         if let stopThreshold = tts.metaData.doubleValue("stopThreshold") {
             // The stop head is prefix-conditioned: some reference clips cross 0.5 at a
@@ -264,12 +302,45 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
             // sigmoid band; the oracle exposes the same knob (runner.py stop_threshold).
             options.stopThreshold = Float(min(max(stopThreshold, 0.05), 0.99))
         }
+        // Stop-head floor (AB-L-0075): crossings inside the first frames are never a real
+        // end of speech — ignore them, and let the energy verdict above the decoder decide
+        // whether the decode was stillborn. "minFrames" overrides.
+        let minFrames = tts.metaData.intValue("minFrames") ?? max(8, condIds.count)
+        options.minFrames = min(max(0, minFrames), options.maxFrames - 1)
         if let cfgScale = tts.metaData.doubleValue("cfgScale") {
             options.cfgScale = Float(cfgScale)
             options.cfgFrames = tts.metaData.intValue("cfgFrames") ?? 20
             options.uncondIds = [GepardConditioner.sot, GepardConditioner.eot, GepardConditioner.sos]
         }
-        return (model, prefix, condIds, options)
+        // Rescue budget for stillborn decodes: re-encode the reference with a tiny gain
+        // nudge and retry, deterministically. "stopRescueAttempts" overrides (0 disables).
+        let rescueAttempts = tts.metaData.intValue("stopRescueAttempts") ?? 3
+        return (model, prefix, condIds, options, referenceClip,
+                min(max(0, rescueAttempts), 6))
+    }
+
+    /// Speaker prefix for a reference clip at a given rescue nudge. Nudge k scales the
+    /// decoded reference by 0.977^k (≈ −0.2 dB per step) before encoding — a tiny,
+    /// identity-preserving, DETERMINISTIC perturbation that relands the prefix-conditioned
+    /// stop head when a (clip, text) pair decodes stillborn (AB-L-0075: greedy decode makes
+    /// stillbirth reproducible per prefix, and a small level change reliably reshuffles it).
+    private func speakerPrefix(for clip: Audio, nudge: Int) throws -> MLXArray {
+        guard let model else { throw PackageError.notLoaded }
+        let key = "\(Self.referenceKey(clip.data))#\(nudge)"
+        if let cached = cachedPrefixes[key] { return cached }
+        RunProgress.report(.encode)
+        let (mono, sourceRate) = try AudioSupport.decodeToMono(clip)
+        var samples22k = SincResampler.resample(
+            audio: mono, from: sourceRate, to: GepardModel.sampleRate)
+        if nudge > 0 {
+            let gain = pow(Float(0.977), Float(nudge))
+            for i in samples22k.indices { samples22k[i] *= gain }
+        }
+        let refCodes = model.encodeReference(samples: samples22k)
+        let p = model.voicePrefix(refCodes: refCodes)
+        eval(p)
+        cachedPrefixes[key] = p
+        return p
     }
 
     /// In-memory cache key for a reference clip (Hasher is per-process seeded, which is all we

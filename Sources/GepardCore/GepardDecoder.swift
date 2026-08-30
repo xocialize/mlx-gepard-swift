@@ -70,15 +70,23 @@ public struct GepardDecoder {
         /// past 0.5 at a mid-utterance sentence pause — raising the threshold rescues those
         /// premature stops (at the cost of occasional trailing babble at 0.9+).
         public var stopThreshold: Float
+        /// Earliest step at which a stop-head crossing is honored (0 = oracle behavior).
+        /// With some (reference clip, text) pairs the prefix-conditioned head crosses within
+        /// the first frames — before any speech (AB-L-0075). The floor ignores those
+        /// crossings; whether the decode then produced actual SPEECH is judged above this
+        /// layer, by audio energy (the stop-head trajectory alone cannot tell: onset-high
+        /// heads occur in healthy runs, near-threshold wiggles occur in stillborn ones).
+        public var minFrames: Int
 
         public init(maxFrames: Int = 2000, cfgScale: Float? = nil,
                     cfgFrames: Int = 20, uncondIds: [Int]? = nil,
-                    stopThreshold: Float = 0.5) {
+                    stopThreshold: Float = 0.5, minFrames: Int = 0) {
             self.maxFrames = maxFrames
             self.cfgScale = cfgScale
             self.cfgFrames = cfgFrames
             self.uncondIds = uncondIds
             self.stopThreshold = stopThreshold
+            self.minFrames = minFrames
         }
     }
 
@@ -146,7 +154,7 @@ public struct GepardDecoder {
             // Stop is read from the COND stream (runner.py) — forces eval, bounds the graph.
             let p = sigmoid(stop).item(Float.self)
             stops.append(p)
-            if p > options.stopThreshold { break }
+            if p > options.stopThreshold, step >= options.minFrames { break }
 
             if cfgOn, step < options.cfgFrames, let uc = uCache {
                 let uh = decodeStep(frameEmbed: fe, cache: uc)   // same audio frame, empty text ctx

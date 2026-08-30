@@ -159,6 +159,9 @@ if args.contains("--probe") {
             for (index, text) in texts.enumerated() {
                 var meta: MetaData = ["stopThreshold": .double(threshold)]
                 if !noMaxFrames { meta["maxFrames"] = .int(2000) }
+                if let floor = env["GEPARD_PROBE_MINFRAMES"].flatMap(Int.init) {
+                    meta["minFrames"] = .int(floor)
+                }
                 let request = TTSRequest(text: text,
                                          voice: VoiceSelector(.referenceAudio(refAudio)),
                                          metaData: meta)
