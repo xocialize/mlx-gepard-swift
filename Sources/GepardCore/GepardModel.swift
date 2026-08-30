@@ -178,13 +178,23 @@ public final class GepardModel {
     /// Full synthesis from a prepared speaker prefix + cond ids → mono 22.05 kHz samples.
     /// `cancelCheck` fires per generated frame (rethrown unchanged); `onFrame(count)` reports
     /// progress. `options` carries maxFrames + the onset-CFG knob.
-    /// One synthesis outcome: the samples, plus whether the decode was STILLBORN — it
-    /// ended at/near the stop floor with essentially no audio energy (the model never began
-    /// speaking; AB-L-0075). Judged by ENERGY, not the stop-head trajectory: onset-high
-    /// heads occur in healthy runs, near-threshold wiggles in stillborn ones.
+    /// One synthesis outcome. `saturated`: the decode was STILLBORN — silence-only output
+    /// (the model never began speaking; AB-L-0075), judged by ENERGY, not the stop-head
+    /// trajectory (onset-high heads occur in healthy runs, near-threshold wiggles in
+    /// stillborn ones). `emitted` (streaming only): whether any chunk reached `onChunk` —
+    /// a decode that ends inside the hold window is returned WHOLE with nothing emitted,
+    /// so the caller can judge it (silence / implausibly short / fine) and either retry
+    /// invisibly or deliver the samples itself.
     public struct Synthesis {
         public let samples: [Float]
         public let saturated: Bool
+        public let emitted: Bool
+
+        public init(samples: [Float], saturated: Bool, emitted: Bool = false) {
+            self.samples = samples
+            self.saturated = saturated
+            self.emitted = emitted
+        }
     }
 
     /// RMS below this (int16-normalized floats) is silence: measured stillborn output sits
@@ -217,6 +227,14 @@ public final class GepardModel {
             return Synthesis(samples: [], saturated: true)
         }
         return Synthesis(samples: samples, saturated: false)
+    }
+
+    /// Streaming hold window: no chunk is emitted until this many frames have decoded, so
+    /// a decode that ENDS earlier can be judged (and discarded/retried) before the
+    /// consumer hears anything. The package sizes it to the text's plausibility floor.
+    public struct HoldWindow: Sendable {
+        public var frames: Int
+        public init(frames: Int) { self.frames = frames }
     }
 
     // MARK: - Streaming synthesis (contract 1.25.0)
@@ -252,16 +270,19 @@ public final class GepardModel {
     public func synthesizeStreaming(
         prefix: MLXArray, condIds: [Int], options: GepardDecoder.Options,
         chunking: StreamingChunkOptions = StreamingChunkOptions(),
+        holdWindow: HoldWindow? = nil,
         onChunk: (_ samples: [Float], _ isFinal: Bool) -> Void,
         cancelCheck: (() throws -> Void)? = nil, onFrame: ((Int) -> Void)? = nil
     ) rethrows -> Synthesis {
         let context = chunking.contextFrames ?? codecDecoder.leftReceptiveFieldFrames
         var frames: [[Int]] = []
         var emittedFrames = 0
-        // Emission holds until past the stop floor: a stillborn decode ends there, so its
-        // silence is judged (and discarded) before anything reaches the consumer, and the
-        // caller can retry with a perturbed prefix as if this attempt never played.
-        var nextEmit = max(max(1, chunking.firstChunkFrames), options.minFrames + 12)
+        // Emission holds until past the hold window (at least the stop floor + margin): a
+        // decode that ends inside it — stillborn silence OR an implausibly short take — is
+        // judged before anything reaches the consumer, and the caller can retry with a
+        // perturbed prefix as if this attempt never played.
+        var nextEmit = max(max(1, chunking.firstChunkFrames),
+                           max(options.minFrames + 12, holdWindow?.frames ?? 0))
         var allSamples: [Float] = []
 
         func decodeWindow(upTo end: Int) -> [Float] {
@@ -291,15 +312,13 @@ public final class GepardModel {
                 })
         }
 
-        // Stillborn verdict BEFORE the tail flush: the decode ended before anything was
-        // emitted (stillborn stops land just past the floor, inside the emission gate) and
-        // it is silence → to the consumer this attempt never existed; the caller retries.
+        // Decode ended inside the hold window: NOTHING was emitted. Judge silence here;
+        // return the whole take un-emitted either way — the caller decides (retry the
+        // implausibly-short, deliver the fine) without the consumer ever hearing a retry.
         if emittedFrames == 0, !frames.isEmpty {
-            let probe = decodeWindow(upTo: frames.count)
-            if Self.isSilence(probe) { return Synthesis(samples: [], saturated: true) }
-            allSamples += probe
-            onChunk(probe, false)
-            emittedFrames = frames.count
+            let whole = decodeWindow(upTo: frames.count)
+            if Self.isSilence(whole) { return Synthesis(samples: [], saturated: true) }
+            return Synthesis(samples: whole, saturated: false, emitted: false)
         }
 
         // Final flush: the remainder after the stop head fired (empty when the stop landed
@@ -307,6 +326,6 @@ public final class GepardModel {
         let tail = frames.count > emittedFrames ? decodeWindow(upTo: frames.count) : []
         allSamples += tail
         onChunk(tail, true)
-        return Synthesis(samples: allSamples, saturated: false)
+        return Synthesis(samples: allSamples, saturated: false, emitted: true)
     }
 }

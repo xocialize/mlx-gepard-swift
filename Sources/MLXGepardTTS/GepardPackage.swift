@@ -151,9 +151,13 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
         let (model, prefix, condIds, options, clip, rescueAttempts) = try conditioning(for: request)
         try Task.checkCancellation()
 
-        // Rollout → dequant → vocode, with the stillborn-decode rescue loop (AB-L-0075):
-        // a saturated attempt produced nothing; re-encode the reference with a tiny gain
-        // nudge (deterministic, identity-preserving) and try again.
+        // Rollout → dequant → vocode, with the stillborn/short-decode rescue loop
+        // (AB-L-0075): a stillborn attempt produced silence; an implausibly SHORT one
+        // produced less audio than the text can possibly take (< ~0.03 s/char — real takes
+        // run 0.05+; a rescue nudge can land in a partial basin, so acceptance is checked,
+        // not assumed). Retry on a log-spaced reference gain ladder; keep the longest take
+        // if the budget runs out.
+        let plausibleSeconds = Double(tts(request)?.text.count ?? 0) * 0.030
         var samples: [Float] = []
         for attempt in 0 ... rescueAttempts {
             let attemptPrefix = attempt == 0 ? prefix
@@ -162,17 +166,19 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
                 prefix: attemptPrefix, condIds: condIds, options: options,
                 cancelCheck: { try Task.checkCancellation() },
                 onFrame: { count in RunProgress.report(.generate, step: count) })
-            if !synthesis.saturated {
+            let seconds = Double(synthesis.samples.count) / Double(GepardModel.sampleRate)
+            if !synthesis.saturated, seconds >= plausibleSeconds {
                 if attempt > 0 {
-                    Self.rescueLog.info("stillborn decode rescued at nudge \(attempt)")
+                    Self.rescueLog.info("rescued at nudge \(attempt) (\(String(format: "%.2f", seconds)) s)")
                 }
                 samples = synthesis.samples
                 break
             }
+            if synthesis.samples.count > samples.count { samples = synthesis.samples }
             if attempt == rescueAttempts {
-                Self.rescueLog.error("stillborn decode persisted through \(rescueAttempts) nudges — emitting silence")
+                Self.rescueLog.error("decode stayed \(samples.isEmpty ? "stillborn" : "short") through \(rescueAttempts) nudges — best take \(String(format: "%.2f", Double(samples.count) / Double(GepardModel.sampleRate))) s")
             } else {
-                Self.rescueLog.info("stillborn decode (attempt \(attempt)) — nudging reference")
+                Self.rescueLog.info("\(synthesis.saturated ? "stillborn" : "short (\(String(format: "%.2f", seconds)) s)") decode (attempt \(attempt)) — nudging reference")
             }
         }
 
@@ -212,15 +218,26 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
         }
 
         var chunkIndex = 0
-        // Stillborn-decode rescue (AB-L-0075): a saturated attempt emits NOTHING (the model
-        // layer gates emission past the probe window), so retrying is invisible downstream.
+        // Stillborn/short-decode rescue (AB-L-0075): the hold window keeps every chunk
+        // back until the decode has either crossed the text's plausibility floor (then it
+        // streams normally) or ENDED inside the window (then it is judged whole: silence or
+        // an implausibly short take retries on the gain ladder — invisibly, nothing was
+        // emitted; a fine short take is delivered as one chunk). Budget exhausted → deliver
+        // the longest take.
+        let plausibleSeconds = Double(tts(request)?.text.count ?? 0) * 0.030
+        // ≤ ~2.5 s of held audio: latency bound. Past it, a premature stop streams (and
+        // truncates) — rarer at longer texts, and the threshold knob still governs it.
+        let holdFrames = min(54, Int(plausibleSeconds * 21.5) + 2)
         var samples: [Float] = []
+        var best: [Float] = []
+        var delivered = false
         for attempt in 0 ... rescueAttempts {
             let attemptPrefix = attempt == 0 ? prefix
                 : try speakerPrefix(for: clip, nudge: attempt)
             let synthesis = try model.synthesizeStreaming(
                 prefix: attemptPrefix, condIds: condIds, options: options,
                 chunking: chunking,
+                holdWindow: .init(frames: holdFrames),
                 onChunk: { chunkSamples, isFinal in
                     emit(TTSStreamChunk(samples: chunkSamples,
                                         sampleRate: GepardModel.sampleRate,
@@ -229,20 +246,39 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
                 },
                 cancelCheck: { try Task.checkCancellation() },
                 onFrame: { count in RunProgress.report(.generate, step: count) })
-            if !synthesis.saturated {
+            let seconds = Double(synthesis.samples.count) / Double(GepardModel.sampleRate)
+            if synthesis.emitted {
+                // Streamed past the hold window — already with the consumer.
                 if attempt > 0 {
-                    Self.rescueLog.info("stillborn decode rescued at nudge \(attempt)")
+                    Self.rescueLog.info("rescued at nudge \(attempt) (\(String(format: "%.2f", seconds)) s, streamed)")
                 }
                 samples = synthesis.samples
+                delivered = true
                 break
             }
-            if attempt == rescueAttempts {
-                Self.rescueLog.error("stillborn decode persisted through \(rescueAttempts) nudges — emitting silence")
-                emit(TTSStreamChunk(samples: [], sampleRate: GepardModel.sampleRate,
+            if !synthesis.saturated, seconds >= plausibleSeconds {
+                // Whole take in hand, plausible — deliver it as one final chunk.
+                if attempt > 0 {
+                    Self.rescueLog.info("rescued at nudge \(attempt) (\(String(format: "%.2f", seconds)) s)")
+                }
+                samples = synthesis.samples
+                emit(TTSStreamChunk(samples: samples, sampleRate: GepardModel.sampleRate,
                                     index: chunkIndex, isFinal: true))
-            } else {
-                Self.rescueLog.info("stillborn decode (attempt \(attempt)) — nudging reference")
+                chunkIndex += 1
+                delivered = true
+                break
             }
+            if synthesis.samples.count > best.count { best = synthesis.samples }
+            if attempt < rescueAttempts {
+                Self.rescueLog.info("\(synthesis.saturated ? "stillborn" : "short (\(String(format: "%.2f", seconds)) s)") decode (attempt \(attempt)) — nudging reference")
+            }
+        }
+        if !delivered {
+            Self.rescueLog.error("decode stayed \(best.isEmpty ? "stillborn" : "short") through \(rescueAttempts) nudges — emitting best take \(String(format: "%.2f", Double(best.count) / Double(GepardModel.sampleRate))) s")
+            samples = best
+            emit(TTSStreamChunk(samples: best, sampleRate: GepardModel.sampleRate,
+                                index: chunkIndex, isFinal: true))
+            chunkIndex += 1
         }
 
         try Task.checkCancellation()
@@ -319,11 +355,19 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
                 min(max(0, rescueAttempts), 6))
     }
 
-    /// Speaker prefix for a reference clip at a given rescue nudge. Nudge k scales the
-    /// decoded reference by 0.977^k (≈ −0.2 dB per step) before encoding — a tiny,
-    /// identity-preserving, DETERMINISTIC perturbation that relands the prefix-conditioned
-    /// stop head when a (clip, text) pair decodes stillborn (AB-L-0075: greedy decode makes
-    /// stillbirth reproducible per prefix, and a small level change reliably reshuffles it).
+    /// Rescue gain ladder, log-spaced: −1 / −3 / −6 dB, then halving. Field-measured
+    /// (AB-L-0075 follow-up): −0.2 dB-spaced nudges landed in the SAME dead basin as the
+    /// original clip ("That sounds right, Captain." stayed stillborn through −0.6 dB),
+    /// while −1 dB flipped it healthy — basin escape needs SPACING, not gentleness, and
+    /// even −6 dB leaves the cloned identity intact (the prefix conditions on timbre far
+    /// more than level).
+    private static let rescueGains: [Float] = [0.891, 0.708, 0.501]
+
+    /// Speaker prefix for a reference clip at a given rescue nudge (0 = the clip as given;
+    /// k ≥ 1 = `rescueGains[k-1]`, halving past the ladder) — a deterministic,
+    /// identity-preserving perturbation that relands the prefix-conditioned stop head when
+    /// a (clip, text) pair decodes stillborn (greedy decode makes stillbirth reproducible
+    /// per prefix, and a level change reliably reshuffles it).
     private func speakerPrefix(for clip: Audio, nudge: Int) throws -> MLXArray {
         guard let model else { throw PackageError.notLoaded }
         let key = "\(Self.referenceKey(clip.data))#\(nudge)"
@@ -333,7 +377,9 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
         var samples22k = SincResampler.resample(
             audio: mono, from: sourceRate, to: GepardModel.sampleRate)
         if nudge > 0 {
-            let gain = pow(Float(0.977), Float(nudge))
+            let gain = nudge <= Self.rescueGains.count
+                ? Self.rescueGains[nudge - 1]
+                : Self.rescueGains.last! * pow(0.5, Float(nudge - Self.rescueGains.count))
             for i in samples22k.indices { samples22k[i] *= gain }
         }
         let refCodes = model.encodeReference(samples: samples22k)
