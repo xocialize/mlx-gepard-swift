@@ -189,11 +189,17 @@ public final class GepardModel {
         public let samples: [Float]
         public let saturated: Bool
         public let emitted: Bool
+        /// The rollout ran into `options.maxFrames` (no honored stop-head crossing) —
+        /// review finding: a cap-hit was previously indistinguishable from a natural stop,
+        /// so cap-truncated takes shipped silently.
+        public let hitCap: Bool
 
-        public init(samples: [Float], saturated: Bool, emitted: Bool = false) {
+        public init(samples: [Float], saturated: Bool, emitted: Bool = false,
+                    hitCap: Bool = false) {
             self.samples = samples
             self.saturated = saturated
             self.emitted = emitted
+            self.hitCap = hitCap
         }
     }
 
@@ -220,13 +226,16 @@ public final class GepardModel {
         let wave = codecDecoder.decode(decoderInput).reshaped([-1])  // [T*1024]
         eval(wave)
         let samples = wave.asArray(Float.self)
+        let hitCap = rollout.codes.count >= options.maxFrames - 1
         // Stillborn verdict: silence-only output is stillborn regardless of where the stop
         // landed — no legitimate decode is all-silence (field: stillborn RMS ~0.0001 vs
-        // real speech 0.04+, at any length observed).
+        // real speech 0.04+, at any length observed). The samples RIDE ALONG (review
+        // finding: returning [] made an exhausted rescue a 44-byte WAV that consumers
+        // recorded as a zero-second success — the longest-take fallback needs real audio).
         if Self.isSilence(samples) {
-            return Synthesis(samples: [], saturated: true)
+            return Synthesis(samples: samples, saturated: true, hitCap: hitCap)
         }
-        return Synthesis(samples: samples, saturated: false)
+        return Synthesis(samples: samples, saturated: false, hitCap: hitCap)
     }
 
     /// Streaming hold window: no chunk is emitted until this many frames have decoded, so
@@ -277,12 +286,15 @@ public final class GepardModel {
         let context = chunking.contextFrames ?? codecDecoder.leftReceptiveFieldFrames
         var frames: [[Int]] = []
         var emittedFrames = 0
-        // Emission holds until past the hold window (at least the stop floor + margin): a
-        // decode that ends inside it — stillborn silence OR an implausibly short take — is
-        // judged before anything reaches the consumer, and the caller can retry with a
-        // perturbed prefix as if this attempt never played.
+        // Emission holds until past the hold window: a decode that ends inside it —
+        // stillborn silence OR an implausibly short take — is judged before anything
+        // reaches the consumer, and the caller can retry with a perturbed prefix as if
+        // this attempt never played. When the caller provides a window it is AUTHORITATIVE
+        // (review finding: max()-ing in `minFrames + 12` here defeated the package's
+        // 54-frame latency cap and made the 6-frame first chunk unreachable — TTFA scaled
+        // with text length instead of the documented ~280 ms floor).
         var nextEmit = max(max(1, chunking.firstChunkFrames),
-                           max(options.minFrames + 12, holdWindow?.frames ?? 0))
+                           holdWindow?.frames ?? (options.minFrames + 12))
         var allSamples: [Float] = []
 
         func decodeWindow(upTo end: Int) -> [Float] {
@@ -312,13 +324,15 @@ public final class GepardModel {
                 })
         }
 
+        let hitCap = frames.count >= options.maxFrames - 1
         // Decode ended inside the hold window: NOTHING was emitted. Judge silence here;
         // return the whole take un-emitted either way — the caller decides (retry the
         // implausibly-short, deliver the fine) without the consumer ever hearing a retry.
+        // Saturated takes keep their samples (see `Synthesis`).
         if emittedFrames == 0, !frames.isEmpty {
             let whole = decodeWindow(upTo: frames.count)
-            if Self.isSilence(whole) { return Synthesis(samples: [], saturated: true) }
-            return Synthesis(samples: whole, saturated: false, emitted: false)
+            return Synthesis(samples: whole, saturated: Self.isSilence(whole),
+                             emitted: false, hitCap: hitCap)
         }
 
         // Final flush: the remainder after the stop head fired (empty when the stop landed
@@ -326,6 +340,11 @@ public final class GepardModel {
         let tail = frames.count > emittedFrames ? decodeWindow(upTo: frames.count) : []
         allSamples += tail
         onChunk(tail, true)
-        return Synthesis(samples: allSamples, saturated: false, emitted: true)
+        // Silence is still JUDGED on the emitted path (review finding: hardcoding false
+        // here let a stillborn that outlasted the hold window stream silence with no log
+        // and no parity with the batch verdict) — the chunks are already with the
+        // consumer, so the flag is telemetry for the caller, not a retry signal.
+        return Synthesis(samples: allSamples, saturated: Self.isSilence(allSamples),
+                         emitted: true, hitCap: hitCap)
     }
 }

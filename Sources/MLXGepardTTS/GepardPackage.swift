@@ -167,6 +167,9 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
                 cancelCheck: { try Task.checkCancellation() },
                 onFrame: { count in RunProgress.report(.generate, step: count) })
             let seconds = Double(synthesis.samples.count) / Double(GepardModel.sampleRate)
+            if synthesis.hitCap {
+                Self.rescueLog.error("decode hit the frame cap (\(String(format: "%.2f", seconds)) s for \(self.tts(request)?.text.count ?? 0) chars) — no honored stop; the take may be truncated or carry a babble tail")
+            }
             if !synthesis.saturated, seconds >= plausibleSeconds {
                 if attempt > 0 {
                     Self.rescueLog.info("rescued at nudge \(attempt) (\(String(format: "%.2f", seconds)) s)")
@@ -225,9 +228,13 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
         // emitted; a fine short take is delivered as one chunk). Budget exhausted → deliver
         // the longest take.
         let plausibleSeconds = Double(tts(request)?.text.count ?? 0) * 0.030
-        // ≤ ~2.5 s of held audio: latency bound. Past it, a premature stop streams (and
-        // truncates) — rarer at longer texts, and the threshold knob still governs it.
-        let holdFrames = min(54, Int(plausibleSeconds * 21.5) + 2)
+        // The hold window is AUTHORITATIVE for the model's emission gate (review finding:
+        // the model max()-ing in its own floor defeated this cap). ≥ minFrames + 12 so a
+        // stillborn stop (which lands just past the floor) is always judged pre-emission;
+        // ≤ 54 frames (~2.5 s) as the latency bound — with the floor now ≤ 16 the two
+        // never conflict.
+        let holdFrames = min(54, max(options.minFrames + 12,
+                                     Int(plausibleSeconds * 21.5) + 2))
         var samples: [Float] = []
         var best: [Float] = []
         var delivered = false
@@ -247,8 +254,15 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
                 cancelCheck: { try Task.checkCancellation() },
                 onFrame: { count in RunProgress.report(.generate, step: count) })
             let seconds = Double(synthesis.samples.count) / Double(GepardModel.sampleRate)
+            if synthesis.hitCap {
+                Self.rescueLog.error("decode hit the frame cap (\(String(format: "%.2f", seconds)) s) — no honored stop; the take may be truncated or carry a babble tail")
+            }
             if synthesis.emitted {
-                // Streamed past the hold window — already with the consumer.
+                // Streamed past the hold window — already with the consumer; a silence
+                // verdict here is telemetry (the audio cannot be retracted), never silent.
+                if synthesis.saturated {
+                    Self.rescueLog.error("emitted take is SILENCE (\(String(format: "%.2f", seconds)) s) — a stillborn outlasted the hold window; raise stopRescueAttempts or report this (clip, text) pair")
+                }
                 if attempt > 0 {
                     Self.rescueLog.info("rescued at nudge \(attempt) (\(String(format: "%.2f", seconds)) s, streamed)")
                 }
@@ -326,10 +340,17 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
         }
         // Default frame budget scales with the text: typical speech runs ~1.4–2.2 frames
         // per character, so ~2.5×chars + 60 is a generous ceiling that still stops a
-        // runaway decode (no honored stop-head crossing — e.g. trailing babble at high
-        // thresholds) from filling the full 2000-frame cap (~93 s). Explicit "maxFrames"
-        // always wins.
-        let derivedCap = min(2000, Int(Double(tts.text.count) * 2.5) + 60)
+        // runaway decode (no honored stop-head crossing — trailing babble at high
+        // thresholds) from filling the full 2000-frame cap (~93 s). Short text gets a
+        // SLOPED bonus (6 frames/char, capped at 260 ≈ 12 s) because it EXPANDS when
+        // verbalized — digit strings, URLs — long in speech while short in characters
+        // (review finding: a 16-char number capped at 4.6 s mid-verbalization,
+        // undetectably, because the cap always exceeds the plausibility floor). Sloped,
+        // not flat, so a runaway on a 3-word exclamation stays bounded at seconds, not
+        // 12 s. Explicit "maxFrames" always wins; cap-hits now log.
+        let chars = Double(tts.text.count)
+        let derivedCap = min(2000, max(Int(chars * 2.5) + 60,
+                                       min(260, Int(chars * 6.0) + 60)))
         let maxFrames = tts.metaData.intValue("maxFrames") ?? derivedCap
         var options = GepardDecoder.Options(maxFrames: max(1, maxFrames))
         if let stopThreshold = tts.metaData.doubleValue("stopThreshold") {
@@ -340,8 +361,14 @@ public final class GepardPackage: ModelPackage, StreamEmitting {
         }
         // Stop-head floor (AB-L-0075): crossings inside the first frames are never a real
         // end of speech — ignore them, and let the energy verdict above the decoder decide
-        // whether the decode was stillborn. "minFrames" overrides.
-        let minFrames = tts.metaData.intValue("minFrames") ?? max(8, condIds.count)
+        // whether the decode was stillborn. Derived from the UNREPEATED token count and
+        // bounded ≤ 16 (review finding: `condIds.count` is the TextRepeater-EXPANDED
+        // layout — up to 8× for short texts — so "Hi." got a 33-frame/1.5 s floor that
+        // suppressed its honest stop and appended ~1 s of babble to every short reply;
+        // the floor's only job is to blunt frame-1–4 instant stops, which ≤16 covers).
+        // "minFrames" overrides.
+        let minFrames = tts.metaData.intValue("minFrames")
+            ?? max(8, min(16, model.conditioner.encode(tts.text).count))
         options.minFrames = min(max(0, minFrames), options.maxFrames - 1)
         if let cfgScale = tts.metaData.doubleValue("cfgScale") {
             options.cfgScale = Float(cfgScale)
