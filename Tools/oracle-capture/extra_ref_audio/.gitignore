@@ -1,0 +1,4 @@
+# Operator-supplied voice candidates: large, session-specific, and of the operator's own
+# provenance ("any clip you have rights to" — see README.md). The README is the contract;
+# the clips are not fixtures.
+*.wav
